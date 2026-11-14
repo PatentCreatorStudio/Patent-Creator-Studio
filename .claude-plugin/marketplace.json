@@ -1,0 +1,36 @@
+{
+  "name": "claude-patent-creator",
+  "owner": {
+    "name": "RobThePCGuy"
+  },
+  "metadata": {
+    "description": "USPTO patent creation and analysis system with hybrid RAG search, worldwide Google Patents search, automated compliance checking, prior art search, and diagram generation.",
+    "version": "1.1.14"
+  },
+  "plugins": [
+    {
+      "name": "claude-patent-creator-standalone",
+      "source": "./",
+      "description": "Patent drafting, prior-art search, USPTO rule search and compliance checks for Claude Code. Needs the companion patent-creator tool (README Quick Start, Step 1) for search and checks.",
+      "version": "1.1.14",
+      "author": {
+        "name": "RobThePCGuy"
+      },
+      "homepage": "https://github.com/RobThePCGuy/Claude-Patent-Creator",
+      "repository": "https://github.com/RobThePCGuy/Claude-Patent-Creator",
+      "license": "MIT",
+      "keywords": [
+        "patent",
+        "uspto",
+        "mpep",
+        "patent-review",
+        "claims-analysis",
+        "prior-art",
+        "patent-search",
+        "bigquery",
+        "diagrams"
+      ],
+      "category": "legal"
+    }
+  ]
+}

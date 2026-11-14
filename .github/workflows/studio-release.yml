@@ -1,0 +1,67 @@
+name: Studio release builds
+
+# Builds the Patent Creator Studio installers on GitHub's own Mac and Windows
+# machines and attaches them to the release for the tag, so every release
+# carries Mac and Windows builds made from the same commit.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build and attach to (for example v0.1.0-beta.3)'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: studio-release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            script: dist:mac
+            files: 'studio/dist/*.zip'
+          - os: windows-latest
+            script: dist:win
+            # The installer only, not the uninstaller electron-builder leaves beside it.
+            files: 'studio/dist/*Setup*[0-9].exe'
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Install
+        working-directory: studio
+        run: npm ci
+
+      - name: Build
+        working-directory: studio
+        # On a tag in CI electron-builder would try to publish by itself; this
+        # workflow does the uploading, so the builder never publishes.
+        run: npm run ${{ matrix.script }} -- --publish never
+
+      - name: Make sure the release exists
+        shell: bash
+        run: |
+          # Both jobs may get here at once; whichever loses the create finds it made.
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --prerelease --verify-tag --title "$TAG" --notes "Builds for $TAG." || \
+            gh release view "$TAG" >/dev/null
+
+      - name: Attach the installers
+        shell: bash
+        run: gh release upload "$TAG" ${{ matrix.files }} --clobber

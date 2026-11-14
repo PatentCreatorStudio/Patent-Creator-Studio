@@ -1,0 +1,1681 @@
+#!/usr/bin/env python3
+"""
+Command-line interface for Claude Patent Creator
+Provides easy setup and management commands
+"""
+
+import argparse
+import json
+
+try:
+    from cli_command import render as _render_cmd
+except ImportError:
+    try:
+        from mcp_server.cli_command import render as _render_cmd
+    except ImportError:  # pragma: no cover - keep messages even if the helper is missing
+
+        def _render_cmd(message: str) -> str:
+            return message
+
+import os
+import platform
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+# Ensure bare inter-module imports work when run via the `patent-creator`
+# entry point (mcp_server.cli:main).  Python only auto-adds the script's
+# directory to sys.path for direct execution, not for package entry points.
+# See: https://github.com/RobThePCGuy/Claude-Patent-Creator/issues/2
+_pkg_dir = str(Path(__file__).parent)
+if _pkg_dir not in sys.path:
+    sys.path.insert(0, _pkg_dir)
+
+# Saved settings must reach the environment before anything reads it: data
+# paths (PATENT_DATA_DIR) are computed at import and commands like
+# check-bigquery read GOOGLE_CLOUD_PROJECT from the environment. Precedence
+# matches the server: real env var > project .env > saved settings.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(Path(__file__).parent.parent / ".env", override=False)
+except ImportError:
+    pass
+try:
+    from config import apply_config_to_env as _apply_saved_settings
+
+    _apply_saved_settings()
+except Exception as _e:  # a broken config file must not block 'config' itself
+    print(f"[WARN] saved settings not applied: {_e}", file=sys.stderr)
+
+# People read this command's output, so prefer readable log lines here. This
+# changes only the default; it never touches PATENT_LOG_FORMAT, so the saved
+# server setting is reported and inherited unchanged.
+try:
+    from logging_config import prefer_format as _prefer_log_format
+
+    _prefer_log_format("human")
+except ImportError:
+    pass
+
+# Import hardware detection for PyTorch installation
+import contextlib
+import io
+
+# The server stack (mcp, torch, faiss, ...) is heavy and may be unavailable when
+# the environment isn't set up yet. Guard these imports so lightweight commands
+# such as `config` still run — that is exactly when a user needs to edit settings.
+# Heavy commands are gated centrally in main() when the stack failed to load.
+# stderr is captured during the attempt so a failed import's diagnostics don't
+# leak onto otherwise-clean lightweight commands; real warnings are re-emitted
+# on success.
+# PyTorch prints this on every Mac import. It is about a distributed-training
+# feature this tool never uses, and to a first-time user it reads like an error.
+_BENIGN_IMPORT_NOISE = ("Redirects are currently not supported in MacOs",)
+
+
+def _drop_benign_import_noise(text: str) -> str:
+    return "".join(
+        line
+        for line in text.splitlines(keepends=True)
+        if not any(noise in line for noise in _BENIGN_IMPORT_NOISE)
+    )
+
+
+_server_import_stderr = io.StringIO()
+try:
+    with contextlib.redirect_stderr(_server_import_stderr):
+        from hardware_detect import (
+            check_pytorch_installation,
+            get_pytorch_install_command,
+        )
+        from server import (
+            INDEX_DIR,
+            MPEP_DIR,
+            MPEP_DOWNLOAD_URL,
+            MPEPIndex,
+            check_all_sources,
+            check_mpep_pdfs,
+            download_35_usc,
+            download_37_cfr,
+            download_mpep_pdfs,
+            download_subsequent_publications,
+            extract_mpep_pdfs,
+        )
+
+    _SERVER_IMPORT_ERROR = None
+    _SERVER_IMPORT_STDERR = ""
+    sys.stderr.write(_drop_benign_import_noise(_server_import_stderr.getvalue()))
+except (ImportError, SystemExit) as exc:  # SystemExit: server.py exits if mcp is missing
+    _SERVER_IMPORT_ERROR = exc
+    # Keep the captured diagnostic (e.g. "mcp package not found") to show only if
+    # a command that actually needs the stack is run — see the guard in main().
+    # str(SystemExit(1)) is just "1", so this captured text is the real message.
+    _SERVER_IMPORT_STDERR = _server_import_stderr.getvalue()
+    check_pytorch_installation = get_pytorch_install_command = None
+    INDEX_DIR = MPEP_DIR = MPEP_DOWNLOAD_URL = MPEPIndex = None
+    check_all_sources = check_mpep_pdfs = None
+    download_35_usc = download_37_cfr = download_mpep_pdfs = None
+    download_subsequent_publications = extract_mpep_pdfs = None
+
+# EPO/PCT law corpus downloaders (lightweight: requests only). Guarded the
+# same way so `patent-creator --help` works in a bare environment.
+try:
+    from epo_downloaders import (
+        check_epo_pct_sources,
+        download_epc,
+        download_pct_guidelines,
+        download_pct_rules,
+        download_pct_treaty,
+        scrape_epo_guidelines,
+    )
+except ImportError:
+    check_epo_pct_sources = download_epc = None
+    download_pct_guidelines = download_pct_rules = download_pct_treaty = None
+    scrape_epo_guidelines = None
+
+# Import path utilities for cross-platform path handling
+try:
+    from path_utils import PathFormatter
+except ImportError:
+    try:
+        from path_utils import PathFormatter
+    except ImportError:
+        PathFormatter = None
+
+
+def _render(message: str) -> str:
+    from cli_command import render
+
+    return render(message)
+
+
+def _cli() -> str:
+    """The exact patent-creator command for this install (see cli_command)."""
+    from cli_command import installed_cli
+
+    return installed_cli()
+
+
+def install_pytorch():
+    """Install PyTorch with hardware-specific acceleration.
+
+    Returns:
+        bool: True if PyTorch was reinstalled (caller should restart), False otherwise
+    """
+
+    # Skip if we're in a restarted subprocess (PyTorch already handled)
+    if os.environ.get("_PYTORCH_ALREADY_INSTALLED"):
+        return False
+
+    # Check current PyTorch status
+    status = check_pytorch_installation()
+
+    if status["installed"]:
+        print(f"  [OK] PyTorch {status['version']} already installed", file=sys.stderr)
+
+        # Check if hardware matches
+        if not status["hardware_match"]:
+            print(f"  [WARNING] {status.get('warning', 'Hardware mismatch')}", file=sys.stderr)
+            print("  Reinstalling PyTorch with correct hardware support...", file=sys.stderr)
+            # Don't return - fall through to reinstall
+        else:
+            # Already installed and matches hardware
+            if status.get("cuda_available"):
+                print("  [OK] CUDA support available", file=sys.stderr)
+            elif status.get("mps_available"):
+                print("  [OK] MPS (Apple Silicon) support available", file=sys.stderr)
+            return False  # No reinstall needed
+
+    # Get correct PyTorch install command for hardware
+    package_spec, index_url, description = get_pytorch_install_command()
+
+    print(f"\n  {description}", file=sys.stderr)
+
+    # Uninstall existing PyTorch first (pip won't replace CPU with CUDA automatically)
+    try:
+        print("  Uninstalling old PyTorch...", file=sys.stderr)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "uninstall", "-y", "torch", "torchvision", "torchaudio"],
+            check=False,  # Don't fail if not installed
+            capture_output=True,
+        )
+    except Exception:
+        pass  # Ignore errors
+
+    # Build pip install command. package_spec may contain multiple
+    # whitespace-separated requirements (e.g. pinned torch + torchvision for
+    # legacy GPUs), so split it into individual pip arguments.
+    cmd = [sys.executable, "-m", "pip", "install", *package_spec.split()]
+    if index_url:
+        cmd.extend(["--index-url", index_url])
+
+    # Install PyTorch
+    try:
+        print("  Installing PyTorch...", file=sys.stderr)
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print("  [OK] PyTorch installed successfully", file=sys.stderr)
+        return True  # Reinstalled - need to restart Python
+    except subprocess.CalledProcessError as e:
+        print(f"  [ERROR] PyTorch installation failed: {e}", file=sys.stderr)
+        print(f"  Output: {e.stderr}", file=sys.stderr)
+        print("  Trying CPU version as fallback...", file=sys.stderr)
+        # Try CPU version as fallback
+        try:
+            subprocess.run([sys.executable, "-m", "pip", "install", "torch>=2.0.0"], check=True)
+            print("  [OK] PyTorch CPU version installed", file=sys.stderr)
+            return True  # Reinstalled - need to restart Python
+        except subprocess.CalledProcessError:
+            print("  [ERROR] Could not install PyTorch. Please install manually:", file=sys.stderr)
+            print(_render_cmd('  pip install "torch>=2.0.0"'), file=sys.stderr)
+            return False  # Failed, continue anyway
+
+
+def _auto_detect_bigquery():
+    """Auto-detect BigQuery credentials and project ID from existing gcloud config.
+
+    Checks (in order):
+    1. Existing application-default credentials file
+    2. GOOGLE_CLOUD_PROJECT env var
+    3. gcloud config for default project
+    4. Credentials file for quota_project_id
+
+    If gcloud is installed and authenticated but no project is set,
+    attempts to extract it from the credentials file.
+    """
+    creds_path = get_gcloud_credentials_path()
+
+    # Check existing credentials
+    if creds_path.exists():
+        print("\n[OK] BigQuery credentials found", file=sys.stderr)
+
+        # Try to extract project ID from credentials if not set in env
+        if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
+            try:
+                import json as _json
+
+                with creds_path.open() as f:
+                    creds = _json.load(f)
+                project_id = creds.get("quota_project_id")
+                if project_id:
+                    print(f"  Auto-detected project: {project_id}", file=sys.stderr)
+            except Exception:
+                pass
+
+        # Also try gcloud config
+        if not os.environ.get("GOOGLE_CLOUD_PROJECT"):
+            try:
+                result = subprocess.run(
+                    ["gcloud", "config", "get-value", "project"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.returncode == 0 and result.stdout.strip() and result.stdout.strip() != "(unset)":
+                    print(f"  Auto-detected project: {result.stdout.strip()}", file=sys.stderr)
+            except Exception:
+                pass
+
+        return
+
+    # No credentials — check if gcloud is installed
+    gcloud_installed = False
+    try:
+        result = subprocess.run(
+            ["gcloud", "--version"], capture_output=True, text=True, timeout=5,
+        )
+        gcloud_installed = result.returncode == 0
+    except Exception:
+        pass
+
+    if gcloud_installed:
+        # gcloud exists but no application-default credentials
+        # Try to run auth non-interactively (will fail, but the error is clear)
+        print("\n[INFO] gcloud CLI detected but no application-default credentials", file=sys.stderr)
+        print("  To enable BigQuery patent search (100M+ patents, free):", file=sys.stderr)
+        print("  In a terminal, run: gcloud auth application-default login", file=sys.stderr)
+        print("  (inside Claude Code you can type: ! gcloud auth application-default login)", file=sys.stderr)
+    else:
+        # No gcloud at all — this is fine, BigQuery is optional
+        print("\n[INFO] BigQuery patent search not configured (optional)", file=sys.stderr)
+        print("  MPEP search, claims review, and all other features work without it.", file=sys.stderr)
+
+
+def _verify_bigquery_setup():
+    """Verify BigQuery is functional — catches missing project ID early during setup."""
+    try:
+        from bigquery_search import BigQueryPatentSearch
+
+        searcher = BigQueryPatentSearch()
+        # Quick test query to verify end-to-end
+        searcher.client.query("SELECT 1", job_config=searcher._make_job_config([])).result(
+            timeout=10
+        )
+        print(
+            f"  BigQuery: [OK] (project: {searcher.billing_project})",
+            file=sys.stderr,
+        )
+    except ValueError:
+        # Missing project ID or bad config — not a failure, BigQuery is optional
+        pass
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+
+def mcp_handshake(python_cmd: str, server_script: str, timeout: float = 180.0) -> tuple[bool, str]:
+    """Start the server exactly as Claude Code will and complete an MCP handshake.
+
+    A matching path in ~/.claude.json proves nothing: the registered Python can
+    exist and still be unable to import mcp. Only a real initialize round trip
+    shows Claude will connect. Returns (ok, detail) where detail is the server
+    name on success or the tail of its stderr on failure.
+    """
+    import tempfile
+    import threading
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "patent-creator-verify", "version": "1"},
+        },
+    }
+    err_file = tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace")  # noqa: SIM115 - closed on every path below
+    try:
+        proc = subprocess.Popen(
+            [python_cmd, server_script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=err_file,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as e:
+        err_file.close()
+        return False, f"could not start {python_cmd}: {e}"
+
+    found: dict = {}
+
+    def _read():
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and msg.get("id") == 1:
+                found["msg"] = msg
+                return
+
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+    except (BrokenPipeError, OSError):
+        pass
+    reader.join(timeout)
+    with contextlib.suppress(Exception):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        proc.wait(timeout=10)
+    msg = found.get("msg")
+    err_file.seek(0)
+    tail = "\n".join(err_file.read().strip().splitlines()[-8:])
+    err_file.close()
+    if msg and "result" in msg:
+        name = ((msg["result"] or {}).get("serverInfo") or {}).get("name", "server")
+        return True, str(name)
+    if msg and "error" in msg:
+        return False, f"server answered with an error: {msg['error']}\n{tail}"
+    if proc.returncode not in (None, 0, -9) and not reader.is_alive():
+        return False, tail or f"server exited with code {proc.returncode}"
+    return False, tail or f"no answer within {int(timeout)} s"
+
+
+def _report_handshake(python_str: str, server_str: str) -> bool:
+    print("\nTesting the connection the way Claude Code will...", file=sys.stderr)
+    ok, detail = mcp_handshake(python_str, server_str)
+    if ok:
+        print(f"  [OK] Server started and answered ({detail})", file=sys.stderr)
+        return True
+    print("  [X] Claude Code will NOT be able to connect: the server did not answer.", file=sys.stderr)
+    for line in detail.splitlines():
+        print(f"      {line}", file=sys.stderr)
+    return False
+
+
+def configure_mcp_server():
+    """
+    Register the MCP server with Claude Code using 'claude mcp add' command
+    """
+    import platform
+
+    # Get correct paths - server.py is in project_root/mcp_server/, not in MPEP_DIR (pdfs/)
+    project_root = Path(__file__).parent.parent.resolve()  # Go up from mcp_server/ to project root
+    server_script = (project_root / "mcp_server" / "server.py").resolve()
+    # Keep the venv symlink: resolving it registers the base interpreter,
+    # which cannot import mcp and makes Claude fail to connect.
+    python_path = Path(sys.executable).absolute()
+
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("Registering MCP Server with Claude Code", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+
+    # Verify paths exist
+    if not python_path.exists():
+        print(f"\n[X] Python executable not found: {python_path}", file=sys.stderr)
+        return False
+
+    if not server_script.exists():
+        print(f"\n[X] Server script not found: {server_script}", file=sys.stderr)
+        return False
+
+    # On Windows, Claude CLI requires git-bash - set environment variable
+    if platform.system() == "Windows":
+        try:
+            result = subprocess.run(["where", "bash"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 and result.stdout.strip():
+                bash_path = result.stdout.strip().split("\n")[0]
+                os.environ["CLAUDE_CODE_GIT_BASH_PATH"] = bash_path
+        except Exception:
+            pass
+
+    # Check if claude command exists
+    try:
+        result = subprocess.run(
+            ["claude", "mcp", "list"], capture_output=True, text=True, timeout=10
+        )
+        claude_available = result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        claude_available = False
+
+    if not claude_available:
+        print("\n[WARNING] Claude CLI not found in PATH", file=sys.stderr)
+        print("\nPlease manually register the MCP server:", file=sys.stderr)
+        # Use PathFormatter if available, otherwise fallback to basic POSIX conversion
+        if PathFormatter:
+            python_str, server_str = PathFormatter.format_for_claude_mcp(python_path, server_script)
+        else:
+            python_str = str(python_path).replace("\\", "/")
+            server_str = str(server_script).replace("\\", "/")
+        print(
+            f'\n  claude mcp add --transport stdio claude-patent-creator --scope user -- "{python_str}" "{server_str}"',
+            file=sys.stderr,
+        )
+        return False
+
+    # Remove existing registration if present
+    with contextlib.suppress(Exception):
+        subprocess.run(
+            ["claude", "mcp", "remove", "claude-patent-creator"],
+            capture_output=True,
+            timeout=10,
+        )
+
+    # Register the MCP server with correct format
+    # Use PathFormatter for proper cross-platform path handling
+    if PathFormatter:
+        python_str, server_str = PathFormatter.format_for_claude_mcp(python_path, server_script)
+    else:
+        python_str = str(python_path).replace("\\", "/")
+        server_str = str(server_script).replace("\\", "/")
+
+    try:
+        cmd = [
+            "claude",
+            "mcp",
+            "add",
+            "--transport",
+            "stdio",
+            "claude-patent-creator",
+            "--scope",
+            "user",
+            "--",
+            python_str,
+            server_str,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+        if result.returncode == 0:
+            print("\n[OK] MCP server registered with Claude Code", file=sys.stderr)
+            print("  Name: claude-patent-creator", file=sys.stderr)
+            print(f"  Python: {python_str}", file=sys.stderr)
+            print(f"  Script: {server_str}", file=sys.stderr)
+            if not _report_handshake(python_str, server_str):
+                return False
+            print("\nVerify with: claude mcp list", file=sys.stderr)
+            print(f"\nVerify paths with: {_cli()} verify-config", file=sys.stderr)
+            return True
+        else:
+            print(f"\n[X] Failed to register MCP server: {result.stderr}", file=sys.stderr)
+            print("\nManual registration command:", file=sys.stderr)
+            print(
+                f'  claude mcp add --transport stdio claude-patent-creator --scope user -- "{python_str}" "{server_str}"',
+                file=sys.stderr,
+            )
+            return False
+    except Exception as e:
+        print(f"\n[X] Failed to register MCP server: {e}", file=sys.stderr)
+        print("\nManual registration command:", file=sys.stderr)
+        # Use PathFormatter for proper path formatting
+        if PathFormatter:
+            python_str, server_str = PathFormatter.format_for_claude_mcp(python_path, server_script)
+        else:
+            python_str = str(python_path).replace("\\", "/")
+            server_str = str(server_script).replace("\\", "/")
+        print(
+            f'  claude mcp add --transport stdio claude-patent-creator --scope user -- "{python_str}" "{server_str}"',
+            file=sys.stderr,
+        )
+        return False
+
+
+def get_gcloud_credentials_path():
+    """
+    Get the correct gcloud application default credentials path for the current OS
+
+    Returns:
+        Path: Platform-specific credentials path
+    """
+    if platform.system() == "Windows":
+        # Windows: %APPDATA%\gcloud\application_default_credentials.json
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            return Path(appdata) / "gcloud" / "application_default_credentials.json"
+        else:
+            return (
+                Path.home()
+                / "AppData"
+                / "Roaming"
+                / "gcloud"
+                / "application_default_credentials.json"
+            )
+    else:
+        # Linux/macOS: $HOME/.config/gcloud/application_default_credentials.json
+        return Path.home() / ".config" / "gcloud" / "application_default_credentials.json"
+
+
+def setup_bigquery_auth_prompt():
+    """
+    Prompt user to setup BigQuery authentication for patent search
+    """
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("BigQuery Patent Search Setup (Optional)", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    print("\nBigQuery provides access to 100M+ patents for prior art search.", file=sys.stderr)
+    print("Setup takes ~5 minutes and requires a free Google Cloud account.", file=sys.stderr)
+    print("(No credit card required for BigQuery sandbox)\n", file=sys.stderr)
+
+    # Check if already authenticated
+    creds_path = get_gcloud_credentials_path()
+    if creds_path.exists():
+        print("[OK] BigQuery authentication already configured", file=sys.stderr)
+        print(f"    Credentials: {creds_path}", file=sys.stderr)
+        return True
+
+    response = input("Setup BigQuery authentication now? (y/N): ").strip().lower()
+    if response != "y":
+        print("\n[SKIPPED] BigQuery is optional. To set it up later:", file=sys.stderr)
+        print("  1. Install gcloud: https://cloud.google.com/sdk/docs/install", file=sys.stderr)
+        print("  2. Run: gcloud auth application-default login", file=sys.stderr)
+        print(f"  3. Run: {_cli()} config set GOOGLE_CLOUD_PROJECT your-project-id", file=sys.stderr)
+        print(f"  4. Test: {_cli()} check-bigquery", file=sys.stderr)
+        return False
+
+    print("\n" + "-" * 60, file=sys.stderr)
+    print("BigQuery Setup Instructions:", file=sys.stderr)
+    print("-" * 60, file=sys.stderr)
+    print("\n1. Install Google Cloud SDK for your OS:", file=sys.stderr)
+
+    system = platform.system()
+    if system == "Windows":
+        print("\n   Windows:", file=sys.stderr)
+        print(
+            "   - Download: https://dl.google.com/dl/cloudsdk/channels/rapid/GoogleCloudSDKInstaller.exe",
+            file=sys.stderr,
+        )
+        print("   - Run the installer and follow prompts", file=sys.stderr)
+        print("   - Restart this terminal after installation", file=sys.stderr)
+    elif system == "Darwin":  # macOS
+        print("\n   macOS:", file=sys.stderr)
+        print("   Option A: Using Homebrew (recommended)", file=sys.stderr)
+        print("     brew install --cask google-cloud-sdk", file=sys.stderr)
+        print("\n   Option B: Manual download", file=sys.stderr)
+        print("     Download: https://cloud.google.com/sdk/docs/install-sdk", file=sys.stderr)
+    else:  # Linux
+        print("\n   Linux:", file=sys.stderr)
+        print("   curl https://sdk.cloud.google.com | bash", file=sys.stderr)
+        print("   exec -l $SHELL  # Restart shell", file=sys.stderr)
+
+    print("\n2. After installing gcloud, run this command:", file=sys.stderr)
+    print("\n   gcloud auth application-default login", file=sys.stderr)
+
+    print("\n3. Sign in with your Google account in the browser", file=sys.stderr)
+    print("   (Creates a free Google Cloud project if you don't have one)", file=sys.stderr)
+
+    print("\n4. Re-run this setup after authentication:", file=sys.stderr)
+    print(f"   {_cli()} setup", file=sys.stderr)
+
+    print("\n" + "=" * 60, file=sys.stderr)
+    input("\nPress Enter to continue setup (BigQuery will be skipped for now)...")
+    return False
+
+
+def _stdin_is_interactive() -> bool:
+    """True when stdin can answer input() prompts."""
+    try:
+        if sys.stdin is None or not sys.stdin.isatty():
+            return False
+        if sys.platform == "win32":
+            # NUL is a character device, so isatty() is True for it; only a
+            # real console handle accepts GetConsoleMode.
+            import ctypes
+            import msvcrt
+
+            handle = msvcrt.get_osfhandle(sys.stdin.fileno())
+            mode = ctypes.c_uint32()
+            return bool(ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)))
+        return True
+    except Exception:
+        return False
+
+
+def _normalize_interactivity(args) -> None:
+    """Force non-interactive mode when stdin cannot answer prompts.
+
+    Without this, setup's input() calls raise EOFError in CI, agent-driven,
+    or piped contexts (issue #52). An explicit --non-interactive always wins.
+    """
+    if not getattr(args, "non_interactive", False) and not _stdin_is_interactive():
+        args.non_interactive = True
+        print(
+            "[INFO] stdin is not a terminal -- running setup non-interactively",
+            file=sys.stderr,
+        )
+
+
+def _graphviz_install_hint() -> str:
+    """One platform-specific command a beginner can copy."""
+    system = platform.system()
+    if system == "Darwin":
+        return "brew install graphviz"
+    if system == "Windows":
+        return "winget install graphviz"
+    return "sudo apt-get install graphviz   (Fedora: sudo dnf install graphviz)"
+
+
+def _graphviz_ready() -> bool:
+
+    return shutil.which("dot") is not None
+
+
+def _setup_graphviz(ensure_fn=None, consent=None) -> bool:
+    """Provision system Graphviz so the diagram tools work out of the box.
+
+    Installing Graphviz changes the computer outside this tool (Homebrew,
+    winget, apt), so it only happens after the user says yes. ``consent`` is
+    a callable asked once before installing; None means "never install, just
+    say how" (non-interactive runs). Best effort: any failure prints guidance
+    and returns False without blocking setup. ``ensure_fn`` is injectable for
+    tests and bypasses the consent step.
+    """
+    print("\nChecking Graphviz (diagram tools)...", file=sys.stderr)
+    if ensure_fn is None:
+        if _graphviz_ready():
+            print("  [OK] Graphviz is installed", file=sys.stderr)
+            return True
+        hint = _graphviz_install_hint()
+        if consent is None or not consent(hint):
+            print(
+                "  [SKIP] Graphviz is not installed. Only the diagram tools need it."
+                f"\n         To add it later, run: {hint}"
+                "\n         then restart Claude Code.",
+                file=sys.stderr,
+            )
+            return False
+        try:
+            from graphviz_installer import ensure_graphviz as ensure_fn
+        except ImportError:
+            try:
+                from mcp_server.graphviz_installer import ensure_graphviz as ensure_fn
+            except ImportError:
+                print("  [SKIP] graphviz_installer module unavailable", file=sys.stderr)
+                return False
+    try:
+        ready, message = ensure_fn()
+    except Exception as e:  # never let the diagram step break setup
+        print(f"  [WARN] Graphviz install attempt failed: {e}", file=sys.stderr)
+        print("  Diagram tools will stay disabled until Graphviz is installed.", file=sys.stderr)
+        return False
+    tag = "[OK]" if ready else "[WARN]"
+    print(f"  {tag} {message}", file=sys.stderr)
+    if not ready:
+        print("  Diagram tools will stay disabled until Graphviz is installed.", file=sys.stderr)
+    return ready
+
+
+def _setup_epo_pct_sources(dest_dir) -> bool:
+    """Download any missing EPO/PCT law sources into dest_dir (issue #49).
+
+    Best effort by design: EPO/WIPO being unreachable must never block US
+    setup — the law-search tools already say honestly when a corpus is
+    missing (#48). Returns True if at least one new source landed, so the
+    caller knows the index needs a rebuild to make it searchable.
+    """
+    if check_epo_pct_sources is None:
+        return False
+
+    downloaders = {
+        "epc": ("EPC (European Patent Convention)", download_epc),
+        "epo_guidelines": ("EPO Guidelines", scrape_epo_guidelines),
+        "pct_treaty": ("PCT Treaty", download_pct_treaty),
+        "pct_rules": ("PCT Regulations", download_pct_rules),
+        "pct_guidelines": ("PCT Guidelines", download_pct_guidelines),
+    }
+
+    try:
+        status = check_epo_pct_sources(dest_dir)
+    except Exception as e:
+        print(f"  EPO/PCT source check failed: {e}", file=sys.stderr)
+        return False
+
+    got_new = False
+    for key, (label, download_fn) in downloaders.items():
+        if status.get(key):
+            print(f"  {label}: [OK]", file=sys.stderr)
+            continue
+        try:
+            ok = download_fn(dest_dir)
+        except Exception as e:
+            print(f"  {label}: [X] {e}", file=sys.stderr)
+            continue
+        if ok:
+            got_new = True
+            print(f"  {label}: [OK] downloaded", file=sys.stderr)
+        else:
+            print(
+                f"  {label}: [X] download failed (EPO/PCT law search will "
+                "report the missing corpus honestly)",
+                file=sys.stderr,
+            )
+    return got_new
+
+
+def setup_command(args):
+    """
+    One-command setup: installs PyTorch, downloads all sources, and builds index
+    """
+    # Propagate --no-hyde as an env var so downstream modules (health_check,
+    # mpep_search) can honour it without receiving the argparse namespace.
+    if args.no_hyde:
+        os.environ["PATENT_MPEP_USE_HYDE"] = "false"
+
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("Claude Patent Creator - Automatic Setup", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+
+    _normalize_interactivity(args)
+
+    # Step 1: Install PyTorch with hardware detection
+    print("\n[1/4] Checking PyTorch installation...", file=sys.stderr)
+    pytorch_reinstalled = install_pytorch()
+
+    # If PyTorch was reinstalled, restart in subprocess with fresh Python interpreter
+    if pytorch_reinstalled:
+        print(
+            "\n  [INFO] Restarting setup with fresh Python interpreter to load new PyTorch...\n",
+            file=sys.stderr,
+        )
+        # Re-exec this script in a subprocess to get fresh Python with new PyTorch
+        result = subprocess.run(
+            [sys.executable, "-m", "mcp_server.cli", "setup"]
+            + (["--rebuild"] if args.rebuild else [])
+            + (["--no-hyde"] if args.no_hyde else [])
+            + (["--non-interactive"] if getattr(args, "non_interactive", False) else []),
+            env={**os.environ, "_PYTORCH_ALREADY_INSTALLED": "1"},
+        )
+        return result.returncode
+
+    # Step 2: Check current status
+    print("\n[2/4] Checking source files...", file=sys.stderr)
+    sources_status = check_all_sources()
+    pdf_count = check_mpep_pdfs()
+
+    print("\nChecking current status...", file=sys.stderr)
+    if sources_status["mpep"]:
+        print(f"  MPEP PDFs: [OK] ({pdf_count} files)", file=sys.stderr)
+    elif _index_ready():
+        print(
+            "  MPEP PDFs: [--] removed after indexing (only needed to rebuild the index)",
+            file=sys.stderr,
+        )
+    else:
+        print("  MPEP PDFs: [X] (0 files)", file=sys.stderr)
+    print(_source_line("35 USC:", sources_status["35_usc"]), file=sys.stderr)
+    print(_source_line("37 CFR:", sources_status["37_cfr"]), file=sys.stderr)
+    print(_source_line("Updates:", sources_status["subsequent_pubs"]), file=sys.stderr)
+
+    # PDFs removed after indexing (setup offers this): the index still works,
+    # so don't re-download ~500 MB and rebuild for half an hour unasked.
+    # An index built by an older version with a known defect gets rebuilt
+    # automatically; re-running setup is what a user does to update.
+    index_defects = _index_defects()
+    if index_defects and not args.rebuild:
+        print("\n[!] Your search index needs rebuilding:", file=sys.stderr)
+        for warning in index_defects:
+            print(f"    {warning}", file=sys.stderr)
+        print("    Rebuilding it now (sources are downloaded again if needed).", file=sys.stderr)
+        args.rebuild = True
+
+    pdfs_cleaned_up = (
+        not sources_status["mpep"] and _index_ready() and not getattr(args, "rebuild", False)
+    )
+
+    # Download missing sources
+    downloads_needed = []
+    if pdfs_cleaned_up:
+        print(
+            "\n[OK] Search index already built; its source PDFs were removed, which is fine."
+            f"\n     Run '{_cli()} setup --rebuild' only if you want to rebuild it.",
+            file=sys.stderr,
+        )
+    else:
+        if not sources_status["mpep"]:
+            downloads_needed.append("MPEP")
+        if not sources_status["35_usc"]:
+            downloads_needed.append("35 USC")
+        if not sources_status["37_cfr"]:
+            downloads_needed.append("37 CFR")
+        if not sources_status["subsequent_pubs"]:
+            downloads_needed.append("Subsequent Publications")
+
+    if downloads_needed:
+        print(f"\n[3/4] Downloading: {', '.join(downloads_needed)}", file=sys.stderr)
+        print("This may take several minutes...\n", file=sys.stderr)
+
+        operations = {
+            "MPEP": lambda: download_mpep_pdfs(MPEP_DOWNLOAD_URL) and extract_mpep_pdfs(),
+            "35 USC": download_35_usc,
+            "37 CFR": download_37_cfr,
+            "Subsequent Publications": download_subsequent_publications,
+        }
+        missing_optional = []
+        for label in downloads_needed:
+            if operations[label]():
+                continue
+            if label == "Subsequent Publications":
+                # A supplement to the MPEP: search still works without it, and
+                # the coverage report names it as missing.
+                print(
+                    f"\n[!] {label} download failed. Continuing without it; "
+                    "searches won't include those updates.",
+                    file=sys.stderr,
+                )
+                missing_optional.append(label)
+                continue
+            print(f"\n[X] {label} download or extraction failed. Setup stopped.", file=sys.stderr)
+            return 1
+
+        if missing_optional:
+            print(f"\n[OK] Required downloads complete ({', '.join(missing_optional)} missing)", file=sys.stderr)
+        else:
+            print("\n[OK] All downloads complete", file=sys.stderr)
+    elif not pdfs_cleaned_up:
+        print("\n[OK] All sources already present", file=sys.stderr)
+
+    # EPO/PCT law corpus (issue #49): best effort, never blocks US setup.
+    print("\nChecking EPO/PCT law sources...", file=sys.stderr)
+    epo_sources_added = False if pdfs_cleaned_up else _setup_epo_pct_sources(MPEP_DIR)
+
+    # Build index. Newly downloaded EPO/PCT sources require a rebuild —
+    # an existing index knows nothing about them.
+    index_exists = (INDEX_DIR / "mpep_index.faiss").exists()
+    if epo_sources_added and index_exists and not args.rebuild:
+        print(
+            "\n  New EPO/PCT sources downloaded — rebuilding index to include them.",
+            file=sys.stderr,
+        )
+
+    if args.rebuild or not index_exists or epo_sources_added:
+        print("\n[4/4] Building search index...", file=sys.stderr)
+        try:
+            import torch
+
+            on_gpu = torch.cuda.is_available()
+        except Exception:
+            on_gpu = False
+        print(
+            "This takes about 5 minutes with an NVIDIA GPU"
+            if on_gpu
+            else "This takes 25-40 minutes on this computer (it builds on the CPU).",
+            file=sys.stderr,
+        )
+        print("A progress line appears every few percent.\n", file=sys.stderr)
+
+        # HyDE only expands search queries; building never uses it.
+        mpep_index = MPEPIndex(use_hyde=False)
+        mpep_index.build_index(force_rebuild=True)
+
+        print("\n[OK] Index built successfully", file=sys.stderr)
+    else:
+        print("\n[OK] Index already exists (use --rebuild to force rebuild)", file=sys.stderr)
+
+    # Diagram tools: provision system Graphviz only with the user's yes
+    # (it installs a system program), best effort, never blocks setup.
+    def _ask_graphviz(hint: str) -> bool:
+        answer = input(
+            "\nThe diagram tools need a free program called Graphviz."
+            f"\nInstall it now by running '{hint}'? (Y/n): "
+        )
+        return answer.strip().lower() in ("", "y", "yes")
+
+    _setup_graphviz(consent=None if getattr(args, "non_interactive", False) else _ask_graphviz)
+
+    # Setup BigQuery authentication (auto-detect in non-interactive, prompt in interactive)
+    if not getattr(args, "non_interactive", False):
+        setup_bigquery_auth_prompt()
+    else:
+        # Non-interactive: auto-detect existing gcloud auth + project ID
+        _auto_detect_bigquery()
+
+    # Verify BigQuery actually works (catches missing project ID)
+    _verify_bigquery_setup()
+
+    # Configure MCP server
+    mcp_configured = configure_mcp_server()
+
+    # Final status
+    print("\n" + "=" * 60, file=sys.stderr)
+    print(
+        "Setup Complete!" if mcp_configured else "Setup finished, but Claude Code is NOT connected yet",
+        file=sys.stderr,
+    )
+    print("=" * 60, file=sys.stderr)
+
+    sources_status = check_all_sources()
+    index_exists = (INDEX_DIR / "mpep_index.faiss").exists()
+
+    print("\nFinal status:", file=sys.stderr)
+    final_pdfs = check_mpep_pdfs()
+    print(
+        f"  MPEP PDFs: [OK] ({final_pdfs} files)"
+        if final_pdfs
+        else "  MPEP PDFs: [--] removed after indexing (only needed to rebuild the index)",
+        file=sys.stderr,
+    )
+    print(_source_line("35 USC:", sources_status["35_usc"]), file=sys.stderr)
+    print(_source_line("37 CFR:", sources_status["37_cfr"]), file=sys.stderr)
+    print(_source_line("Updates:", sources_status["subsequent_pubs"]), file=sys.stderr)
+    print("  Index:     [OK]" if index_exists else "  Index:     [X]", file=sys.stderr)
+    print(
+        f"  MCP:       {'[OK]' if mcp_configured else '[WARNING] Manual setup required'}",
+        file=sys.stderr,
+    )
+
+    if mcp_configured:
+        print("\nClaude Code Integration:", file=sys.stderr)
+        print("  [OK] MCP server registered (user scope)", file=sys.stderr)
+        print("  [OK] Available from any directory", file=sys.stderr)
+    else:
+        print("\n[WARNING] MCP server auto-registration failed", file=sys.stderr)
+        print("  See manual registration command above", file=sys.stderr)
+
+    # The skills (incl. the patent-application-creator campaign workflow)
+    # ship as a Claude Code plugin, NOT inside this Python package — without
+    # these two commands a user gets the tools but never the campaign.
+    print("\nClaude Code skills (patent campaign workflow):", file=sys.stderr)
+    print(
+        "  claude plugin marketplace add RobThePCGuy/Claude-Patent-Creator",
+        file=sys.stderr,
+    )
+    print(
+        "  claude plugin install claude-patent-creator-standalone@claude-patent-creator",
+        file=sys.stderr,
+    )
+    print(
+        "  (re-run the install command after upgrades to refresh the skills)",
+        file=sys.stderr,
+    )
+
+    # Check BigQuery status for final message
+    bq_works = False
+    try:
+        from bigquery_search import BigQueryPatentSearch
+
+        # Construct to verify BigQuery is reachable/configured; raises if not.
+        BigQueryPatentSearch()
+        bq_works = True
+    except Exception:
+        pass
+
+    if not mcp_configured:
+        print(
+            f"\nFix the connection problem shown above, then run '{_cli()} setup' again."
+            "\n(The download and index are kept, so it finishes in under a minute.)",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("\nReady to use! Restart Claude Code, then try:", file=sys.stderr)
+    print('  "Search MPEP for claim definiteness requirements"', file=sys.stderr)
+    print('  "Review my patent claims for 35 USC 112(b) compliance"', file=sys.stderr)
+    if bq_works:
+        print('  "Search for patents about neural networks filed in 2024"', file=sys.stderr)
+
+    return 0
+
+
+def _index_ready() -> bool:
+    """The search index is what the server runs on; the PDFs are only needed to
+    rebuild it. Setup offers to delete them after indexing, so readiness must
+    never depend on them."""
+    return (INDEX_DIR / "mpep_index.faiss").exists() and (
+        INDEX_DIR / "mpep_metadata.json"
+    ).exists()
+
+
+_INDEXED_SOURCES: "set[str] | None" = None
+
+
+def _indexed_sources() -> set[str]:
+    """Source types present in the built index's metadata (cached)."""
+    global _INDEXED_SOURCES
+    if _INDEXED_SOURCES is None:
+        try:
+            with (INDEX_DIR / "mpep_metadata.json").open(encoding="utf-8") as f:
+                _INDEXED_SOURCES = {m.get("source", "MPEP") for m in json.load(f).get("metadata", [])}
+        except Exception:
+            _INDEXED_SOURCES = set()
+    return _INDEXED_SOURCES
+
+
+# Status label -> source type the extractor records in index metadata.
+_LABEL_SOURCE = {"35 USC:": "35_USC", "37 CFR:": "37_CFR", "Updates:": "SUBSEQUENT"}
+
+
+def _source_line(label: str, present: bool) -> str:
+    """One status line for a downloaded source file. A removed file is fine
+    only when the index really holds that source's text; otherwise it is
+    missing and flagged."""
+    if present:
+        mark = "[OK]"
+    elif _index_ready() and _LABEL_SOURCE.get(label) in _indexed_sources():
+        mark = "[--] removed after indexing (its text is in the search index)"
+    else:
+        mark = "[X]"
+    return f"  {label:<10} {mark}"
+
+
+def _index_defects() -> list[str]:
+    """Known defects in an already-built index that only a rebuild fixes
+    (e.g. indexes built before the EPC article/rule split was repaired)."""
+    if not _index_ready():
+        return []
+    try:
+        from mpep_search import get_index_warnings
+
+        with (INDEX_DIR / "mpep_metadata.json").open(encoding="utf-8") as f:
+            metadata = json.load(f).get("metadata", [])
+        return [_render(w) for w in get_index_warnings(metadata)]
+    except Exception:
+        return []
+
+
+def run_server(args):
+    """
+    Run the MCP server
+    """
+    # Check if setup has been run
+    if not _index_ready():
+        print(
+            f"\n[X] Setup not complete. Run '{_cli()} setup' first.",
+            file=sys.stderr,
+        )
+        return 1
+
+    print("Starting MCP server...", file=sys.stderr)
+
+    # Run the server.py script as a subprocess to ensure clean initialization
+    # and proper tool registration exactly like 'claude mcp add' does
+    server_script = Path(__file__).parent / "server.py"
+    cmd = [sys.executable, str(server_script)]
+
+    # Bridge file-backed settings into the environment so the server subprocess
+    # inherits them (an explicitly-set env var still wins). See mcp_server.config.
+    from config import apply_config_to_env
+
+    apply_config_to_env()
+
+    env = os.environ.copy()
+    if args.no_hyde:
+        env["PATENT_MPEP_USE_HYDE"] = "false"
+
+    try:
+        result = subprocess.run(cmd, env=env)
+        return result.returncode
+    except KeyboardInterrupt:
+        return 0
+
+def status_command(args):
+    """
+    Show current installation status
+    """
+    sources_status = check_all_sources()
+    pdf_count = check_mpep_pdfs()
+    index_exists = (INDEX_DIR / "mpep_index.faiss").exists()
+
+    print("\nClaude Patent Creator Status", file=sys.stderr)
+    print("=" * 40, file=sys.stderr)
+
+    # GPU Status
+    import torch
+
+    print("\nHardware:", file=sys.stderr)
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+        print(f"  GPU:       [OK] {gpu_name}", file=sys.stderr)
+        print(f"  Memory:    {gpu_memory:.1f} GB", file=sys.stderr)
+    else:
+        print("  GPU:       [X] Not available (using CPU)", file=sys.stderr)
+
+    print("\nSources:", file=sys.stderr)
+    if sources_status["mpep"]:
+        print(f"  MPEP PDFs: [OK] ({pdf_count} files)", file=sys.stderr)
+    elif _index_ready():
+        print(
+            "  MPEP PDFs: [--] removed after indexing (only needed to rebuild the index)",
+            file=sys.stderr,
+        )
+    else:
+        print("  MPEP PDFs: [X] (0 files)", file=sys.stderr)
+    print(_source_line("35 USC:", sources_status["35_usc"]), file=sys.stderr)
+    print(_source_line("37 CFR:", sources_status["37_cfr"]), file=sys.stderr)
+    print(_source_line("Updates:", sources_status["subsequent_pubs"]), file=sys.stderr)
+
+    print("\nIndex:", file=sys.stderr)
+    print(f"  Built:     {'[OK]' if index_exists else '[X]'}", file=sys.stderr)
+
+    if index_exists:
+        metadata_file = INDEX_DIR / "mpep_metadata.json"
+        if metadata_file.exists():
+            import json
+
+            with metadata_file.open(encoding="utf-8") as f:
+                data = json.load(f)
+                print(f"  Chunks:    {len(data['chunks']):,}", file=sys.stderr)
+                print(
+                    f"  Sections:  {len({m['section'] for m in data['metadata']}):,}",
+                    file=sys.stderr,
+                )
+        for warning in _index_defects():
+            print(f"  [!] {warning}", file=sys.stderr)
+
+    print("\nStorage:", file=sys.stderr)
+    print(f"  Location:  {MPEP_DIR.absolute()}", file=sys.stderr)
+    print(f"  Index dir: {INDEX_DIR.absolute()}", file=sys.stderr)
+
+    ready = _index_ready()
+    defects = _index_defects()
+    label = "Setup required" if not ready else ("Ready, but the index needs a rebuild" if defects else "Ready")
+    print(f"\nStatus: {label}", file=sys.stderr)
+
+    if not ready:
+        print(f"\nRun '{_cli()} setup' to complete installation.", file=sys.stderr)
+    elif defects:
+        print(f"\nRun '{_cli()} setup' to rebuild it (25-40 minutes without an NVIDIA GPU).", file=sys.stderr)
+
+    return 0
+
+
+def verify_config_command(args):
+    """Verify Claude Code MCP configuration"""
+    print("\n" + "=" * 70, file=sys.stderr)
+    print("Claude Code MCP Configuration Verification", file=sys.stderr)
+    print("=" * 70, file=sys.stderr)
+
+    # Determine config file location
+    home_dir = Path.home()
+    config_path = home_dir / ".claude.json"
+
+    # Get expected paths
+    project_root = Path(__file__).parent.parent.resolve()
+    expected_python = Path(sys.executable).absolute()
+    expected_server = (project_root / "mcp_server" / "server.py").resolve()
+
+    print("\nExpected Configuration:", file=sys.stderr)
+    print(f"  Python: {expected_python}", file=sys.stderr)
+    print(f"  Server: {expected_server}", file=sys.stderr)
+    print(f"  Config: {config_path}", file=sys.stderr)
+
+    # Check if paths exist
+    print("\nPath Verification:", file=sys.stderr)
+    if expected_python.exists():
+        print("  [OK] Python executable found", file=sys.stderr)
+    else:
+        print(f"  [X] Python executable NOT found: {expected_python}", file=sys.stderr)
+
+    if expected_server.exists():
+        print("  [OK] Server script found", file=sys.stderr)
+    else:
+        print(f"  [X] Server script NOT found: {expected_server}", file=sys.stderr)
+
+    # Check Claude config
+    print("\nClaude Configuration:", file=sys.stderr)
+    if not config_path.exists():
+        print(f"  [X] Config file not found: {config_path}", file=sys.stderr)
+        print(f"\n  Run '{_cli()} setup' to create it", file=sys.stderr)
+        return 1
+
+    try:
+        with config_path.open(encoding="utf-8") as f:
+            config = json.load(f)
+
+        if "mcpServers" not in config:
+            print("  [X] No 'mcpServers' section found", file=sys.stderr)
+            return 1
+
+        if "claude-patent-creator" not in config["mcpServers"]:
+            print("  [X] 'claude-patent-creator' server not registered", file=sys.stderr)
+            print(f"\n  Run: {_cli()} setup", file=sys.stderr)
+            return 1
+
+        server_config = config["mcpServers"]["claude-patent-creator"]
+        actual_python = server_config.get("command", "")
+        actual_args = server_config.get("args", [])
+        actual_server = actual_args[0] if actual_args else ""
+
+        print("  [OK] Configuration found", file=sys.stderr)
+        print("\nActual Configuration:", file=sys.stderr)
+        print(f"  Python: {actual_python}", file=sys.stderr)
+        print(f"  Server: {actual_server}", file=sys.stderr)
+
+        # Normalize paths for comparison (handle forward/backslash differences)
+        def normalize_path(p):
+            return str(Path(p).resolve()).lower() if p else ""
+
+        def normalize_interpreter(p):
+            # Never resolve an interpreter: a venv python and its base
+            # interpreter resolve to the same file but behave differently.
+            return str(Path(p).absolute()).replace("\\", "/").lower() if p else ""
+
+        expected_python_norm = normalize_interpreter(expected_python)
+        expected_server_norm = normalize_path(expected_server)
+        actual_python_norm = normalize_interpreter(actual_python)
+        actual_server_norm = normalize_path(actual_server)
+
+        print("\nConfiguration Status:", file=sys.stderr)
+
+        python_match = expected_python_norm == actual_python_norm
+        server_match = expected_server_norm == actual_server_norm
+
+        if python_match:
+            print("  [OK] Python path is correct", file=sys.stderr)
+        else:
+            print("  [X] Python path mismatch!", file=sys.stderr)
+            print(f"    Expected: {expected_python}", file=sys.stderr)
+            print(f"    Actual:   {actual_python}", file=sys.stderr)
+
+        if server_match:
+            print("  [OK] Server path is correct", file=sys.stderr)
+        else:
+            print("  [X] Server path mismatch!", file=sys.stderr)
+            print(f"    Expected: {expected_server}", file=sys.stderr)
+            print(f"    Actual:   {actual_server}", file=sys.stderr)
+
+        if python_match and server_match and not _report_handshake(actual_python, actual_server):
+            print(f"\n[X] The registered server does not start. Re-run: {_cli()} setup", file=sys.stderr)
+            return 1
+
+        if python_match and server_match:
+            print("\n[OK] Configuration is correct!", file=sys.stderr)
+            print("\nIf the server still fails:", file=sys.stderr)
+            print("  1. Restart Claude Code", file=sys.stderr)
+            print("  2. Check logs in Claude Code", file=sys.stderr)
+            print("  3. Try: claude mcp list", file=sys.stderr)
+            return 0
+        else:
+            print("\n[X] Configuration needs to be fixed!", file=sys.stderr)
+            print("\nTo fix:", file=sys.stderr)
+            print(f"  Option 1: Run '{_cli()} setup' to re-register", file=sys.stderr)
+            print(f"  Option 2: Manually edit {config_path}", file=sys.stderr)
+            print("\nCorrect values:", file=sys.stderr)
+            print(f'  "command": "{expected_python.as_posix()}"', file=sys.stderr)
+            print(f'  "args": ["{expected_server.as_posix()}"]', file=sys.stderr)
+            return 1
+
+    except json.JSONDecodeError as e:
+        print(f"  [X] Invalid JSON in config file: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"  [X] Error reading config: {e}", file=sys.stderr)
+        return 1
+
+
+def check_bigquery_command(args):
+    """
+    Check BigQuery authentication and availability
+    """
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("BigQuery Authentication Check", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+
+    try:
+        from bigquery_search import check_bigquery_available
+    except ImportError:
+        # Fallback if imported from elsewhere
+        from mcp_server.bigquery_search import check_bigquery_available
+
+    status = check_bigquery_available()
+
+    if status.get("available"):
+        print("\n[OK] BigQuery is successfully authenticated and available!", file=sys.stderr)
+        print(f"  Project: {status.get('project')}", file=sys.stderr)
+        if "us_patents" in status:
+            print(f"  US Patents Indexed: {status.get('us_patents'):,}", file=sys.stderr)
+        return 0
+    else:
+        print("\n[X] BigQuery is NOT available", file=sys.stderr)
+        print(f"  Error: {status.get('error', 'Unknown error')}", file=sys.stderr)
+        if "message" in status:
+            print(f"  Details: {status.get('message')}", file=sys.stderr)
+        if "install_command" in status:
+            print(f"\n  To fix run: {status.get('install_command')}", file=sys.stderr)
+        return 1
+
+
+def health_command(args):
+    """Alias for status command"""
+    return status_command(args)
+
+
+def rebuild_index_command(args):
+    """Rebuild MPEP search index"""
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("Building MPEP Search Index", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+
+    sources_status = check_all_sources()
+    if not sources_status["mpep"]:
+        print(f"\n[X] MPEP PDFs not found. Run '{_cli()} download-mpep' or 'setup' first.", file=sys.stderr)
+        return 1
+
+    # Propagate env var for use_hyde
+    if getattr(args, "no_hyde", False):
+        os.environ["PATENT_MPEP_USE_HYDE"] = "false"
+
+    # HyDE only expands search queries; building never uses it.
+    mpep_index = MPEPIndex(use_hyde=False)
+    mpep_index.build_index(force_rebuild=True)
+
+    print("\n[OK] MPEP index rebuilt successfully", file=sys.stderr)
+    return 0
+
+
+def download_mpep_command(args):
+    """Download MPEP PDFs only"""
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("Downloading MPEP PDFs", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+
+    if download_mpep_pdfs(MPEP_DOWNLOAD_URL) and extract_mpep_pdfs():
+        print("\n[OK] MPEP download and extraction complete", file=sys.stderr)
+        return 0
+    else:
+        print("\n[X] MPEP download or extraction failed.", file=sys.stderr)
+        return 1
+
+
+def download_all_command(args):
+    """Download all sources (MPEP + 35 USC + 37 CFR)"""
+    print("\n" + "=" * 60, file=sys.stderr)
+    print("Downloading All USPTO Sources", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+
+    success = True
+    if download_mpep_pdfs(MPEP_DOWNLOAD_URL) and extract_mpep_pdfs():
+        print("[OK] MPEP complete", file=sys.stderr)
+    else:
+        print("[X] MPEP failed", file=sys.stderr)
+        success = False
+
+    for label, download in [("35 USC", download_35_usc), ("37 CFR", download_37_cfr),
+                            ("Updates", download_subsequent_publications)]:
+        if download():
+            print(f"[OK] {label} complete", file=sys.stderr)
+        else:
+            print(f"[X] {label} download failed", file=sys.stderr)
+            success = False
+
+    print("\nEPO/PCT law sources:", file=sys.stderr)
+    if _setup_epo_pct_sources(MPEP_DIR):
+        print(
+            f"  New EPO/PCT sources downloaded. Run '{_cli()} setup --rebuild' "
+            "to make them searchable.",
+            file=sys.stderr,
+        )
+
+    if success:
+        print("\n[OK] Required US source downloads completed successfully", file=sys.stderr)
+        return 0
+    else:
+        print("\n[X] Required US source downloads failed. See the errors above.", file=sys.stderr)
+        return 1
+
+
+def _format_config_value(opt, value, source):
+    """Render a setting for display, masking secrets."""
+    if opt.is_secret:
+        shown = "(set)" if value else "(not set)"
+    elif value == "":
+        shown = "(empty)"
+    else:
+        shown = value
+    return shown, source
+
+
+def config_list_command(args):
+    """Print all settings, their effective values, and where each comes from."""
+    from config import OPTIONS, config_path, get_effective
+
+    sections: dict = {}
+    for opt in OPTIONS:
+        sections.setdefault(opt.section, []).append(opt)
+
+    print(f"Config file: {config_path()}\n")
+    print("Resolution order: environment variable > config file > default\n")
+    for section, opts in sections.items():
+        print(f"== {section} ==")
+        for opt in opts:
+            value, source = get_effective(opt.key)
+            shown, _ = _format_config_value(opt, value, source)
+            print(f"  {opt.key}")
+            print(f"      = {shown}   [{source}]")
+            print(f"      {opt.description}")
+            if opt.note:
+                print(f"      note: {_render(opt.note)}")
+        print()
+    print(f"Change a setting:  {_cli()} config set <KEY> <VALUE>")
+    return 0
+
+
+def config_get_command(args):
+    from config import OPTIONS_BY_KEY, get_effective
+
+    if args.key not in OPTIONS_BY_KEY:
+        print(f"[X] Unknown setting: {args.key}", file=sys.stderr)
+        print(f"    Run '{_cli()} config list' to see valid keys.", file=sys.stderr)
+        return 1
+    value, source = get_effective(args.key)
+    opt = OPTIONS_BY_KEY[args.key]
+    shown, _ = _format_config_value(opt, value, source)
+    print(f"{shown}   [{source}]")
+    return 0
+
+
+def config_set_command(args):
+    from config import OPTIONS_BY_KEY, normalize, save_value, validate
+
+    if args.key not in OPTIONS_BY_KEY:
+        print(f"[X] Unknown setting: {args.key}", file=sys.stderr)
+        print(f"    Run '{_cli()} config list' to see valid keys.", file=sys.stderr)
+        return 1
+    error = validate(args.key, args.value)
+    if error:
+        print(f"[X] Invalid value for {args.key}: {error}", file=sys.stderr)
+        return 1
+    value = normalize(args.key, args.value)
+    path = save_value(args.key, value)
+    opt = OPTIONS_BY_KEY[args.key]
+    shown = "(set)" if opt.is_secret else value
+    print(f"[OK] {args.key} = {shown}")
+    print(f"     Saved to {path}")
+    if opt.is_secret:
+        print("     Note: stored in plaintext; protect this file.", file=sys.stderr)
+    if opt.note:
+        print(f"     {_render(opt.note)}")
+    return 0
+
+
+def config_unset_command(args):
+    from config import OPTIONS_BY_KEY, unset_value
+
+    if args.key not in OPTIONS_BY_KEY:
+        print(f"[X] Unknown setting: {args.key}", file=sys.stderr)
+        return 1
+    unset_value(args.key)
+    print(f"[OK] {args.key} removed from the config file (default/env now apply).")
+    return 0
+
+
+def config_path_command(args):
+    from config import config_path
+
+    print(config_path())
+    return 0
+
+
+def config_gui_command(args):
+    """Launch the desktop settings window."""
+    from config_gui import launch
+
+    return launch()
+
+
+def config_command(args):
+    """Dispatch bare `config`: GUI with --gui, otherwise the listing."""
+    if getattr(args, "gui", False):
+        return config_gui_command(args)
+    return config_list_command(args)
+
+
+def main():
+    """
+    Main CLI entry point
+    """
+    parser = argparse.ArgumentParser(
+        description="Claude Patent Creator - Examiner-level patent creation",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=_render("""
+Examples:
+  patent-creator setup                    # Setup MPEP/USC/CFR sources
+  patent-creator status                   # Show MPEP installation status
+  patent-creator health                   # System health check
+  patent-creator verify-config            # Verify Claude Code configuration
+  patent-creator serve                    # Run the MCP server
+
+  patent-creator rebuild-index            # Rebuild MPEP index
+  patent-creator download-mpep            # Download MPEP PDFs only
+  patent-creator download-all             # Download all sources (MPEP + 35 USC + 37 CFR)
+  patent-creator check-bigquery           # Check BigQuery connection
+
+For more information: https://github.com/RobThePCGuy/Claude-Patent-Creator
+        """),
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # Check BigQuery command
+    check_bigquery_parser = subparsers.add_parser("check-bigquery", help="Check BigQuery authentication and availability")
+    check_bigquery_parser.set_defaults(func=check_bigquery_command)
+
+    # Setup command
+    setup_parser = subparsers.add_parser("setup", help="Download sources and build index")
+    setup_parser.add_argument("--rebuild", action="store_true", help="Force rebuild of index")
+    setup_parser.add_argument(
+        "--no-hyde",
+        action="store_true",
+        help="Disable HyDE query expansion (already off unless PATENT_MPEP_USE_HYDE=true)",
+    )
+    setup_parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Skip interactive prompts (for CI/plugin use)",
+    )
+    setup_parser.set_defaults(func=setup_command)
+
+    # Serve command
+    serve_parser = subparsers.add_parser("serve", help="Run the MCP server")
+    serve_parser.add_argument(
+        "--no-hyde",
+        action="store_true",
+        help="Disable HyDE query expansion (already off unless PATENT_MPEP_USE_HYDE=true)",
+    )
+    serve_parser.set_defaults(func=run_server)
+
+    # Status command
+    status_parser = subparsers.add_parser("status", help="Show installation status")
+    status_parser.set_defaults(func=status_command)
+
+    # Health command (alias for status)
+    health_parser = subparsers.add_parser("health", help="System health check (alias for status)")
+    health_parser.set_defaults(func=health_command)
+
+    # Rebuild index command
+    rebuild_parser = subparsers.add_parser("rebuild-index", help="Rebuild MPEP index")
+    rebuild_parser.add_argument(
+        "--no-hyde",
+        action="store_true",
+        help="Disable HyDE query expansion (already off unless PATENT_MPEP_USE_HYDE=true)",
+    )
+    rebuild_parser.set_defaults(func=rebuild_index_command)
+
+    # Download MPEP command
+    download_mpep_parser = subparsers.add_parser("download-mpep", help="Download MPEP PDFs only")
+    download_mpep_parser.set_defaults(func=download_mpep_command)
+
+    # Download all command
+    download_all_parser = subparsers.add_parser("download-all", help="Download all sources (MPEP + 35 USC + 37 CFR)")
+    download_all_parser.set_defaults(func=download_all_command)
+
+    # Verify config command
+    verify_parser = subparsers.add_parser(
+        "verify-config", help="Verify Claude Code MCP configuration"
+    )
+    verify_parser.set_defaults(func=verify_config_command)
+
+    # Config command (view/edit settings)
+    config_parser = subparsers.add_parser(
+        "config", help="View or change settings (API keys, BigQuery cap, device, ...)"
+    )
+    config_parser.add_argument(
+        "--gui", action="store_true", help="Open the desktop settings window"
+    )
+    config_parser.set_defaults(func=config_command)
+    config_sub = config_parser.add_subparsers(dest="config_action")
+    config_sub.add_parser("list", help="List all settings and their values").set_defaults(
+        func=config_list_command
+    )
+    cfg_get = config_sub.add_parser("get", help="Print one setting's value")
+    cfg_get.add_argument("key")
+    cfg_get.set_defaults(func=config_get_command)
+    cfg_set = config_sub.add_parser("set", help="Set a setting in the config file")
+    cfg_set.add_argument("key")
+    cfg_set.add_argument("value")
+    cfg_set.set_defaults(func=config_set_command)
+    cfg_unset = config_sub.add_parser("unset", help="Remove a setting from the config file")
+    cfg_unset.add_argument("key")
+    cfg_unset.set_defaults(func=config_unset_command)
+    config_sub.add_parser("path", help="Print the config file path").set_defaults(
+        func=config_path_command
+    )
+
+    # Download patents command
+    args = parser.parse_args()
+
+    if not args.command:
+        parser.print_help()
+        return 0
+
+    # `config` is intentionally usable without the heavy server stack, so users
+    # can set credentials/options before everything else is installed.
+    if args.command != "config" and _SERVER_IMPORT_ERROR is not None:
+        print("[X] Could not load required dependencies.", file=sys.stderr)
+        detail = _SERVER_IMPORT_STDERR.strip() or str(_SERVER_IMPORT_ERROR)
+        if detail:
+            print("    " + detail.replace("\n", "\n    "), file=sys.stderr)
+        print(
+            _render(
+                "    Reinstall them with: pip install --upgrade "
+                "git+https://github.com/RobThePCGuy/Claude-Patent-Creator.git\n"
+                "    (from a source checkout: pip install -e .), then retry.\n"
+                "    ('patent-creator config' works without them.)"
+            ),
+            file=sys.stderr,
+        )
+        return 1
+
+    # Run the selected command
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
