@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import { LAYOUT, PHASES, phaseById, parseDecision, parseRedTeam } from './workflow.js';
 import { docxProblems } from './docx-copies.js';
 import { figuresHash, DRAWINGS_PDF } from './drawings-pdf.js';
-import { fingerprint, linksIn, readFile, DRAFT_SET, REVIEW_SET } from './projects.js';
+import { fingerprint, fileHash, linksIn, readFile, DRAFT_SET, REVIEW_SET } from './projects.js';
 
 const sha = (s) => createHash('sha256').update(s).digest('hex');
 
@@ -76,7 +76,7 @@ export function missingDeliverables(p, phase) {
 }
 
 // Called when a step finishes. Everything the stamp will later be held to.
-export function makeStamp(p, phase, { state, engine, family, at, searchReady, basis = basisNow(p), afterAt }) {
+export function makeStamp(p, phase, { state, engine, family, at, searchReady, basis = basisNow(p), afterAt, secondOpinion, secondOpinionHash }) {
   // `afterAt` and `basis` are what the run started from, not what is true now.
   const s = { at, state, engine, family, after: phase.after ? afterAt ?? p.stamps?.[phase.after]?.at ?? null : null };
   if (!phase.after) s.disclosure = basis.disclosure;
@@ -86,7 +86,11 @@ export function makeStamp(p, phase, { state, engine, family, at, searchReady, ba
   if (phase.checksDraft) s.draft = fingerprint(p, DRAFT_SET);
   if (phase.id === 'sweep') s.searchReady = !!searchReady;
   if (phase.id === 'verify' && state === 'no-go') s.noGo = fingerprint(p, [LAYOUT.noGo]);
-  if (phase.id === 'decision') s.decision = parseDecision(readFile(p, LAYOUT.decision));
+  if (phase.id === 'decision') {
+    s.decision = parseDecision(readFile(p, LAYOUT.decision));
+    if (secondOpinion) s.secondOpinion = secondOpinion;
+    if (secondOpinionHash) s.secondOpinionHash = secondOpinionHash;
+  }
   if (phase.id === 'redteam') {
     s.review = fingerprint(p, REVIEW_SET);
     // Both reports carry a verdict; one FAIL, or one missing verdict, is a FAIL.
@@ -103,12 +107,29 @@ const stepName = (id) => {
   return `step ${ph.n} ("${ph.title}")`;
 };
 
+// The inventor may file against a NO-GO. The choice is kept on step 3's own
+// record, so running step 3 again clears it, and it stands only while the
+// decision report is exactly the one they read.
+export const overruled = (st) => st?.state === 'no-go' && st.decision === 'NO-GO' && !!st.overruledByInventor;
+
+export function decisionAllowsDraft(st) {
+  if (overruled(st)) return true;
+  return st?.state === 'done' && st.decision === 'GO' && ['AGREE', 'DISAGREE-overridden', 'skipped-by-inventor'].includes(st.secondOpinion);
+}
+
 function staleReason(p, phase, st, up) {
   if (phase.after) {
     if (!up.ok) return `${cap(stepName(phase.after))} must finish first.`;
     if (st.after !== p.stamps[phase.after].at) return `${cap(stepName(phase.after))} ran again. Run this step again.`;
   } else if (st.disclosure !== disclosureHash(p)) return 'You changed the description of your idea, or what you said about showing it in public, after this step ran.';
   if (phase.usesIntake && st.intake !== intakeHash(p)) return 'Your answers changed after this step ran.';
+  if (phase.id === 'decision' && st.decision === 'GO') {
+    if (!decisionAllowsDraft(st)) return 'The filing recommendation needs a second opinion. Run step 3 again.';
+    if (st.secondOpinion !== 'skipped-by-inventor') {
+      if (linksIn(p, ['03-decision']).length || !st.secondOpinionHash || st.secondOpinionHash !== fileHash(p, LAYOUT.secondOpinion)) return 'The second opinion is missing or changed. Run step 3 again.';
+    }
+  }
+  if (phase.id === 'decision' && overruled(st) && st.overruledByInventor.decisionHash !== fileHash(p, LAYOUT.decision)) return 'The decision report changed after you chose to file anyway. Run step 3 again.';
   // A step that ended by saying "stop" (no-go, blocked) owes no deliverables.
   // The fix step's no-go owes exactly one thing: the report that explains it.
   // The fix step's no-go stands on its report and the draft it judged.
@@ -159,7 +180,7 @@ export function evaluate(p, runningId = null) {
     let locked = null;
     if (up && !up.ok) locked = up.status === 'running' ? `Opens when ${stepName(ph.after)} finishes.` : `Opens after ${stepName(ph.after)} is done.`;
     else if (ph.id === 'claims' && !p.stamps?.sweep?.searchReady) locked = 'Patent search was unavailable. Add a search key in Settings, then run step 2 again.';
-    else if (ph.id === 'claims' && p.stamps?.decision?.decision !== 'GO') locked = 'Opens after step 3 recommends filing.';
+    else if (ph.requiresGo && (!steps.decision.ok || !decisionAllowsDraft(p.stamps?.decision))) locked = 'Opens after step 3 recommends filing with a second opinion, or after you choose to continue or to file anyway.';
     steps[ph.id] = { status, note, ok, locked };
   }
   return steps;
@@ -190,7 +211,7 @@ export function readiness(p, steps = evaluate(p)) {
   // Before a decision exists, the one thing to do is the first step in the
   // chain whose result is not standing.
   const firstOpen = ['audit', 'mining', 'sweep', 'decision'].find((id) => !steps[id].ok);
-  const early = (detail) => ({ level: 'early', label: 'In progress', detail, decision: null, missing: [`Run ${stepName(firstOpen)}.`] });
+  const early = (detail) => ({ level: 'early', label: 'In progress', detail, decision: null, missing: [steps[firstOpen].status === 'needs-input' ? `Answer the questions in ${stepName(firstOpen)}.` : `Run ${stepName(firstOpen)}.`] });
   const sweep = steps.sweep;
   const dec = steps.decision;
   if (!sweep.ok) {
@@ -201,13 +222,14 @@ export function readiness(p, steps = evaluate(p)) {
     return { level: 'blocked', label: 'Patent search needed', detail: 'The search ran without access to patents.', decision: null, missing: ['Add a search key in Settings, then run step 2 again.'] };
   }
   if (!dec.ok) {
-    return early(dec.status === 'stale' ? `The decision has to be made again. ${dec.note}` : 'The filing recommendation is pending.');
+    return early(dec.status === 'stale' ? `The decision has to be made again. ${dec.note}` : dec.status === 'needs-input' ? p.phases?.decision?.decisionReview?.verdict === 'DISAGREE' && p.phases.decision.decisionReview.hash === fileHash(p, LAYOUT.secondOpinion) ? 'The two AIs disagree about whether filing is worth the money. You decide what happens next.' : 'The filing decision is waiting for your answers.' : 'The filing recommendation is pending.');
   }
   const decision = p.stamps.decision.decision;
-  if (decision === 'NO-GO') {
-    return { level: 'nogo', label: 'Finished: not worth filing', detail: 'The AI recommends stopping. Read the decision report for the evidence and alternatives.', decision, missing: [] };
+  const against = overruled(p.stamps.decision);
+  if (decision === 'NO-GO' && !against) {
+    return { level: 'nogo', label: 'Finished: not worth filing', detail: 'The AI recommends stopping. Read the decision report for the evidence and alternatives. If you still want to file, you can choose File anyway in step 3.', decision, missing: [] };
   }
-  if (decision !== 'GO') {
+  if (decision !== 'GO' && !against) {
     return { level: 'blocked', label: 'Blocked', detail: 'The AI needs more information to make a recommendation.', decision, missing: ['Read the decision report for what to resolve before running step 3 again.'] };
   }
 
@@ -267,11 +289,13 @@ export function readiness(p, steps = evaluate(p)) {
     );
   }
 
-  if (missing.length) return { level: 'working', label: 'Drafting', detail: 'Still to resolve:', decision, missing };
+  // A failed second-AI review is answered by one more round of steps 6, 7 and 8.
+  const fixRound = !!(rt && steps.redteam.status === 'done' && rt.verdict === 'FAIL');
+  if (missing.length) return { level: 'working', label: against ? "Drafting (against the AI's recommendation)" : 'Drafting', detail: 'Still to resolve:', decision, missing, fixRound };
   return {
     level: 'review',
-    label: "Ready for professional review",
-    detail: 'The required automated checks passed on these files. The second AI reported no required fixes. This is not legal advice or a promise of a patent. Have a registered patent practitioner review the draft before filing.',
+    label: against ? "Ready for professional review (against the AI's recommendation)" : 'Ready for professional review',
+    detail: 'The required automated checks passed on these files. The second AI reported no required fixes. This is not legal advice or a promise of a patent. Have a registered patent practitioner review the draft before filing.' + (against ? ` At step 3 the AI recommended not filing; you chose to file anyway on ${String(p.stamps.decision.overruledByInventor.at).slice(0, 10)}. Its reasons are in ${LAYOUT.decision}.` : '') + (p.stamps.decision.secondOpinion === 'DISAGREE-overridden' ? ' At step 3 the second AI disagreed with going ahead; you chose to continue.' : p.stamps.decision.secondOpinion === 'skipped-by-inventor' ? ' At step 3 a second AI was unavailable; you chose to continue on one AI\'s recommendation.' : ''),
     decision,
     missing: [],
   };

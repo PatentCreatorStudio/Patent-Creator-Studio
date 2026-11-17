@@ -222,9 +222,10 @@ export function fileHash(p, rel) {
 
 // One fingerprint over a set of files and folders: every path and every byte.
 // Adding, removing or editing any file inside changes it.
-export function fingerprint(p, rels) {
+export function fingerprint(p, rels, { exclude = [] } = {}) {
   const entries = [];
   const add = (rel) => {
+    if (exclude.includes(rel)) return;
     const full = path.join(p.folder, rel);
     let st;
     try {

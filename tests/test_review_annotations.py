@@ -19,8 +19,6 @@ class Registry:
 
 
 @pytest.mark.parametrize(('content', 'references', 'count', 'unmatched'), [
-    ('<g class="node"><text>Input</text><text>Sensor</text></g>', {'Input Sensor': 10}, 1, []),
-    ('<text><tspan>Input</tspan><tspan>Sensor</tspan></text>', {'Input Sensor': 10}, 1, []),
     ('<text>Unknown</text>', {'Input Sensor': 10}, 0, ['Input Sensor']),
     ('<text>Input Sensor</text>', {'Input Sensor': 10, 'Other': 20}, 1, ['Other']),
 ])

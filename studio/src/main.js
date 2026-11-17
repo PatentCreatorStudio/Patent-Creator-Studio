@@ -1,11 +1,11 @@
-import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron';
+import { app, BrowserWindow, ipcMain, shell, dialog, Menu, clipboard } from 'electron';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readFileSync, existsSync, appendFileSync, mkdirSync, lstatSync, renameSync } from 'node:fs';
-import { detectAll, streamCommand, loginShellPath, childEnv } from './env.js';
+import { detectAll, streamCommand, loginShellPath, childEnv, pyprojectVersion, compareVersions, processesRunningFrom, pythonToolsVersion, pythonVersion, pyprojectMinPython, toolsStatusReady, toolsPython } from './env.js';
 import { loadSettings, saveSettings, keyStatus, setKey, getKey, ensureWorkspace } from './settings.js';
 import * as projects from './projects.js';
-import { PHASES, phaseById, statusProtocol, questionsFile, parseStatus, LAYOUT } from './workflow.js';
+import { PHASES, SECOND_OPINION, phaseById, statusProtocol, questionsFile, parseStatus, parseDecision, LAYOUT } from './workflow.js';
 import * as campaign from './campaign.js';
 import { ENGINES, runEngine } from './engines.js';
 import * as gates from './gates.js';
@@ -13,6 +13,7 @@ import { writeInside, removeInside } from './safe-write.js';
 import { writeDocxCopies } from './docx-copies.js';
 import { writeDrawingsPdf, DRAWINGS_PDF } from './drawings-pdf.js';
 import { saveGitHistory } from './git-history.js';
+import { saveMaterialText } from './material-text.js';
 import * as installers from './installers.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -30,15 +31,28 @@ function send(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
 }
 
+// The version of the patent tools this app carries and installs. An installed
+// copy older than this is updated from Setup before anything runs on it.
+const BUNDLED_TOOLS_VERSION = pyprojectVersion(path.join(REPO_ROOT, 'pyproject.toml'));
+const MIN_TOOLS_PYTHON = pyprojectMinPython(path.join(REPO_ROOT, 'pyproject.toml'));
+
 async function env(force = false) {
-  if (!envCache || force) envCache = await detectAll(loadSettings());
+  if (!envCache || force) envCache = await detectAll({ ...loadSettings(), bundledToolsVersion: BUNDLED_TOOLS_VERSION });
   return envCache;
 }
 
 function pcPath() {
-  const p = envCache?.patentCreator?.path;
-  if (!p) throw new Error('Patent tools are missing. Install them in Setup.');
-  return p;
+  const t = envCache?.patentCreator;
+  if (!t?.path) throw new Error('Patent tools are missing. Install them in Setup.');
+  // Old tools would check the draft with old rules, so nothing runs on them.
+  if (t.outdated) {
+    throw new Error(
+      t.canUpdate
+        ? `The patent tools on this computer are out of date (${t.version || 'an older version'}; this app needs ${t.neededVersion}). Open Setup and select Update.`
+        : `The patent tools on this computer are a development copy at ${t.version || 'an older version'}; this app needs ${t.neededVersion}. Update that copy, then select Check again in Setup.`
+    );
+  }
+  return t.path;
 }
 
 // Search keys saved in the app reach the patent tools through the environment
@@ -93,6 +107,15 @@ function createWindow() {
     if (/^https?:\/\//.test(url)) shell.openExternal(url);
   });
   win.webContents.on('will-attach-webview', (e) => e.preventDefault());
+  // Right-click: Copy for selected text anywhere, and Cut/Paste in text boxes.
+  win.webContents.on('context-menu', (_e, p) => {
+    const items = [];
+    if (p.isEditable) items.push({ role: 'cut', enabled: p.editFlags.canCut }, { role: 'copy', enabled: p.editFlags.canCopy }, { role: 'paste', enabled: p.editFlags.canPaste }, { type: 'separator' }, { role: 'selectAll' });
+    else if (p.selectionText.trim()) items.push({ role: 'copy' }, { type: 'separator' }, { role: 'selectAll' });
+    else items.push({ role: 'selectAll' });
+    if (p.linkURL && /^https?:\/\//.test(p.linkURL)) items.unshift({ label: 'Copy link', click: () => clipboard.writeText(p.linkURL) }, { type: 'separator' });
+    Menu.buildFromTemplate(items).popup({ window: win });
+  });
 }
 
 function view(p) {
@@ -108,6 +131,7 @@ function view(p) {
     // What is happening for this invention right now, if anything.
     running: op?.phaseId || null,
     busy: op ? { phaseId: op.phaseId, stage: op.stage } : null,
+    fixing: fixRounds.get(fresh.id)?.status || null,
   };
 }
 
@@ -155,18 +179,117 @@ async function checksOnly(projectId, fn) {
 
 // ---- running a step ------------------------------------------------------
 
-async function runPhase(projectId, phaseId, { engine: engineOverride, reply, fresh } = {}) {
+// Told to every AI run: where its work goes. A save anywhere else is refused.
+function folderRule(folder) {
+  return `The invention folder is ${folder} and it is your working directory. Save every file inside it, using paths relative to it exactly as given (for example ${LAYOUT.sweep}). Never rewrite or shorten the folder path. A save outside this folder is refused.`;
+}
+
+// What an AI tool reports when the internet, not the work, failed. Only the
+// tool's own failure output is matched, never the AI's prose.
+const NET_DROP = /ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENETUNREACH|ENETDOWN|Can't reach the API|stream disconnected|error sending request|fetch failed|Connection error|socket hang up/i;
+const MAX_DROP_RETRIES = 3;
+
+// Resolves true once the AI service answers over HTTPS again (any reply
+// counts; a name that merely resolves does not). Waits 20 seconds before each
+// check, for up to an hour. Each check gives up after 10 seconds, so Stop ends
+// the wait within about 10 seconds.
+async function waitForNetwork(host, op, limitMs = 60 * 60 * 1000) {
+  const until = Date.now() + limitMs;
+  while (!op.cancelled && Date.now() < until) {
+    for (let i = 0; i < 10 && !op.cancelled; i++) await new Promise((r) => setTimeout(r, 2000));
+    if (op.cancelled) break;
+    try {
+      await fetch(`https://${host}/`, { method: 'HEAD', signal: AbortSignal.timeout(10000) });
+      return !op.cancelled;
+    } catch {}
+  }
+  return false;
+}
+
+const fixRounds = new Map(); // projectId -> { cancelled, status }
+
+// A fingerprint of everything a step can be judged against: the inventor's
+// answers and dates, and every file the campaign stamps.
+function filesNow(projectId) {
+  const p = projects.loadProject(projectId);
+  return JSON.stringify([campaign.basisNow(p), projects.fingerprint(p, projects.DRAFT_SET), projects.fingerprint(p, [LAYOUT.noGo, LAYOUT.packageDir])]);
+}
+const MAX_FIX_ROUNDS = 3;
+
+// Starts a step and resolves with its final state once it has finished.
+async function runAndWait(projectId, phaseId) {
+  await runPhase(projectId, phaseId, { fromFixRound: true });
+  while (ops.has(projectId)) await new Promise((r) => setTimeout(r, 3000));
+  return projects.loadProject(projectId).phases?.[phaseId]?.state;
+}
+
+// One button for "the second AI found problems": steps 6, 7 and 8 again,
+// round after round, until the review passes, a step needs the inventor,
+// recommends stopping or fails, or MAX_FIX_ROUNDS rounds have run. While it
+// runs, steps cannot be started by hand.
+function startFixRound(projectId) {
+  findProject(projectId);
+  if (fixRounds.has(projectId) || ops.has(projectId)) throw new Error('This invention is busy. Wait for the current work to finish.');
+  const fr = { cancelled: false, status: 'Starting the fix round…' };
+  fixRounds.set(projectId, fr);
+  fixRound(projectId, fr);
+  return { started: true };
+}
+
+async function fixRound(projectId, fr) {
+  const changed = () => send('project:changed', view({ id: projectId }));
+  let outcome = '';
+  try {
+    for (let round = 1; round <= MAX_FIX_ROUNDS && !outcome; round++) {
+      for (const phaseId of ['verify', 'package', 'redteam']) {
+        if (fr.cancelled) {
+          outcome = 'Fix round stopped.';
+          break;
+        }
+        const ph = phaseById(phaseId);
+        fr.status = `Fix round ${round} of up to ${MAX_FIX_ROUNDS}: step ${ph.n}, ${ph.title}.`;
+        changed();
+        const st = await runAndWait(projectId, phaseId);
+        if (fr.cancelled) outcome = 'Fix round stopped.';
+        else if (st !== 'done' && st !== 'done-unconfirmed') outcome = st === 'needs-input' ? 'Fix round paused: a step needs your answers.' : st === 'no-go' ? 'Fix round finished: the app recommends not filing.' : 'Fix round stopped: a step did not finish. Read its summary.';
+        if (outcome) break;
+      }
+      if (outcome) break;
+      const r = view({ id: projectId }).readiness;
+      if (r.level === 'review') outcome = 'Fix round finished: ready for professional review.';
+      else if (!r.fixRound) outcome = 'Fix round finished. Read what is still open above.';
+      else if (round === MAX_FIX_ROUNDS) outcome = `The second AI still found problems after ${MAX_FIX_ROUNDS} rounds. Read its reports, then select Fix and review again to keep going.`;
+    }
+  } catch (err) {
+    outcome = `Fix round stopped: ${err.message}`;
+  } finally {
+    fixRounds.delete(projectId);
+    send('run:event', { projectId, phaseId: 'redteam', ev: { kind: /ready|recommends/.test(outcome) ? 'gate' : 'warn', text: outcome } });
+    changed();
+  }
+}
+
+async function runPhase(projectId, phaseId, { engine: engineOverride, reply, fresh, fromFixRound } = {}) {
   const settings = loadSettings();
   const e = await env();
+  if (fromFixRound && fixRounds.get(projectId)?.cancelled) throw new Error('Fix round stopped.');
   const p = findProject(projectId);
   const phase = phaseById(phaseId);
   if (!phase) throw new Error('This step is unavailable. Reopen the invention.');
   if (ops.has(projectId)) throw new Error('This invention is busy. Wait for the current work to finish.');
+  if (fixRounds.has(projectId) && !fromFixRound) throw new Error('A fix round is running. Stop it first.');
 
   const step = campaign.evaluate(p)[phaseId];
   if (step.locked) throw new Error(step.locked);
 
-  const engine = engineOverride || defaultEngine(p, phase, settings);
+  const prev = p.phases?.[phaseId];
+  // A reply to a second opinion belongs to the AI that made the first
+  // recommendation, even if the screen's engine selection has changed.
+  const decisionReview = phaseId === 'decision' && reply ? prev?.decisionReview : null;
+  if (decisionReview && (decisionReview.afterAt !== p.stamps?.sweep?.at || JSON.stringify(decisionReview.basis) !== JSON.stringify(campaign.basisNow(p)) || decisionReview.decisionHash !== projects.fileHash(p, LAYOUT.decision) || (decisionReview.hash && decisionReview.hash !== projects.fileHash(p, LAYOUT.secondOpinion)))) {
+    throw new Error('The facts or decision reports changed while step 3 was waiting. Select Run again for a new recommendation and second opinion.');
+  }
+  const engine = decisionReview?.firstEngine || engineOverride || defaultEngine(p, phase, settings);
   const def = ENGINES[engine];
   if (!def) throw new Error('This AI choice is unavailable. Choose an AI in Settings.');
   const cliPath = e[def.cli]?.path;
@@ -185,7 +308,6 @@ async function runPhase(projectId, phaseId, { engine: engineOverride, reply, fre
   const key = def.key ? getKey(def.key) : null;
   const pc = pcPath();
 
-  const prev = p.phases?.[phaseId];
   const startedAt = new Date().toISOString();
   const logFile = projects.runLogPath(p, phaseId, startedAt);
   const run = { at: startedAt, engine, log: path.basename(logFile), reply: !!reply };
@@ -193,6 +315,8 @@ async function runPhase(projectId, phaseId, { engine: engineOverride, reply, fre
   // What this run starts from. The stamp it leaves is held to these, so an
   // answer changed or an earlier step rerun while it works shows as out of date.
   op.basis = campaign.basisNow(p);
+  op.decisionReview = decisionReview || null;
+  if (decisionReview && /^continue[.!]?$/i.test(reply.trim())) op.decisionReview.continuedByInventor = true;
   // An earlier no-go report is moved aside (kept, renamed), so the only
   // report that can stand for this run is one this run writes.
   if (phaseId === 'verify' && !reply) {
@@ -208,7 +332,7 @@ async function runPhase(projectId, phaseId, { engine: engineOverride, reply, fre
     if (rec.stamps) delete rec.stamps[phaseId];
     else rec.stamps = {};
     if (phaseId === 'claims' && !rec.writer) rec.writer = family(engine);
-    rec.phases = { ...(rec.phases || {}), [phaseId]: { ...(prev || {}), state: 'running', current: run } };
+    rec.phases = { ...(rec.phases || {}), [phaseId]: { ...(prev || {}), ...(phaseId === 'decision' ? { decisionReview: op.decisionReview } : {}), state: 'running', current: run } };
   });
   send('project:changed', view(p));
 
@@ -218,12 +342,73 @@ async function runPhase(projectId, phaseId, { engine: engineOverride, reply, fre
   return { started: true, engine };
 }
 
+function otherEngine(fam) {
+  return fam === 'claude' ? (getKey('openai') && !envCache?.codex?.loggedIn ? 'codex-key' : 'codex-sub') : getKey('anthropic') && !envCache?.claude?.loggedIn ? 'claude-key' : 'claude-sub';
+}
+
 function defaultEngine(p, phase, settings) {
-  const other = (fam) => (fam === 'claude' ? (getKey('openai') && !envCache?.codex?.loggedIn ? 'codex-key' : 'codex-sub') : getKey('anthropic') && !envCache?.claude?.loggedIn ? 'claude-key' : 'claude-sub');
+  const other = otherEngine;
   const same = (fam) => other(fam === 'claude' ? 'codex' : 'claude');
   if (phase.role === 'review') return p.writer && family(settings.reviewEngine) === p.writer ? other(p.writer) : settings.reviewEngine;
   if (phase.writes === 'draft' && phase.id !== 'claims' && p.writer && family(settings.draftEngine) !== p.writer) return same(p.writer);
   return settings.draftEngine;
+}
+
+function decisionReplyTask(review, reply) {
+  if (!review) return '';
+  const stop = /^stop[.!]?$/i.test(reply.trim());
+  return `\n\nThis is the inventor's reply to the step 3 second opinion. Read the latest answers in ${LAYOUT.answers}.
+${review.verdict === 'DISAGREE' ? `Read ${LAYOUT.secondOpinion} and rewrite ${LAYOUT.decision}, weighing its independent searches and concerns against the inventor's answers. Do not edit or delete the second opinion. The app will not run that cross-check again for this reply.` : `The other AI was unavailable. An explicit "continue" reply accepts proceeding on one AI's recommendation; record that choice in ${LAYOUT.decision}. Otherwise the app will try to obtain the second opinion again if you recommend GO.`}
+${stop ? `The inventor chose stop. Write DECISION: NO-GO in ${LAYOUT.decision} with the evidence and alternatives, then end with STATUS: no-go.` : 'Reapply the worth-it screen. If you still recommend GO after a disagreement, explain why and record the inventor\'s choice to proceed despite it. If more inventor evidence is needed, ask for it; do not assume it exists.'}`;
+}
+
+// This run shares the decision operation and Stop handle, but never shares
+// the first AI's conversation. A failed process cannot supply an agreement.
+async function secondOpinion({ op, projectId, p, engine: firstEngine, pc, settings, logFile, say }) {
+  setStage(projectId, op, 'second-opinion');
+  const available = await env(true);
+  if (op.cancelled) throw new Error('Step stopped. Select Run again to restart.');
+  const engine = otherEngine(family(firstEngine));
+  const def = ENGINES[engine];
+  const key = def.key ? getKey(def.key) : null;
+  const context = { firstEngine, secondEngine: engine, basis: op.basis, afterAt: op.afterAt };
+  if (!available[def.cli]?.path || (def.key ? !key : !available[def.cli]?.loggedIn)) return { ...context, verdict: 'unavailable' };
+
+  removeInside(p.folder, LAYOUT.secondOpinion);
+  // Every report and draft file the campaign judges must stay as it was.
+  // The only permitted change is the second opinion's own report.
+  const protectedFiles = () => projects.fingerprint(p, [LAYOUT.intake, LAYOUT.audit, LAYOUT.candidates, LAYOUT.sweep, LAYOUT.decision, LAYOUT.answers, ...projects.DRAFT_SET, LAYOUT.verification, LAYOUT.noGo, LAYOUT.examiner, LAYOUT.packageReview, LAYOUT.packageDir]);
+  const before = protectedFiles();
+  let finalEv = null;
+  let result;
+  say('gate', `${def.cli === 'claude' ? 'Claude' : 'Codex'} is searching independently and checking whether filing is worth the money.`);
+  try {
+    const handle = runEngine({ engine, cliPath: available[def.cli].path, pcPath: pc, repoRoot: REPO_ROOT, appDataDir: app.getPath('userData'), cwd: p.folder, systemText: `${skillText()}\n\n${statusProtocol(SECOND_OPINION)}\n\n${folderRule(p.folder)}\n\nThis run is: ${SECOND_OPINION.skillPhase}.`, prompt: SECOND_OPINION.task, resumeId: null, settings, key, serverEnv: searchEnv(), readDirs: (p.intake?.materials || []).filter((m) => m && existsSync(m)) }, (ev) => {
+      if (ev.kind === 'final') finalEv = ev;
+      projects.appendRunLog(logFile, { t: Date.now(), stage: 'second-opinion', engine, ...ev });
+      send('run:event', { projectId, phaseId: 'decision', ev });
+    });
+    op.stop = handle.stop;
+    result = await handle.done;
+  } finally {
+    op.stop = null;
+    if (protectedFiles() !== before) throw new Error('The second AI changed files outside its second-opinion report. Review the changed files and run step 3 again.');
+  }
+  if (op.cancelled || result.signal) throw new Error('Step stopped during the second opinion. Select Run again to restart.');
+  if (result.code !== 0 || !finalEv || finalEv.ok === false) throw new Error('The second AI did not finish. Read the run details, check its connection and sign-in in Setup, then run step 3 again.');
+  if (parseStatus(finalEv.text).status !== 'done') throw new Error('The second AI did not confirm a completed opinion. Read the run details and run step 3 again.');
+  const firstLine = (projects.readFile(p, LAYOUT.secondOpinion) || '').split(/\r?\n/)[0];
+  const verdict = firstLine === 'SECOND OPINION: AGREE' ? 'AGREE' : firstLine === 'SECOND OPINION: DISAGREE' ? 'DISAGREE' : null;
+  if (!verdict || projects.linksIn(p, ['03-decision']).length) throw new Error('The second AI did not save a valid second-opinion report. Run step 3 again.');
+  return { ...context, verdict, hash: projects.fileHash(p, LAYOUT.secondOpinion), sessionId: result.sessionId, costUsd: finalEv.costUsd ?? null };
+}
+
+function secondOpinionQuestion(p, review) {
+  const question = review.verdict === 'DISAGREE'
+    ? `The two AIs disagree about whether filing is worth the money. Read ${LAYOUT.decision} and ${LAYOUT.secondOpinion}.\n\nReply "continue" to draft anyway, "stop" to end with a not-worth-filing result, or answer the concerns and evidence requested in the second opinion. The first AI will weigh your reply and rewrite its recommendation.`
+    : `A second AI is needed to check the recommendation before drafting. ${family(review.secondEngine) === 'claude' ? 'Claude' : 'Codex'} is not installed or signed in and has no usable API-key setup. Open Setup to install or sign in, or add its API key in Settings, then reply that it is ready. You may instead reply "continue" to proceed on one AI's recommendation, or "stop" to end with a not-worth-filing result.`;
+  writeInside(p.folder, questionsFile('decision'), question + '\n');
+  return question;
 }
 
 async function execute({ op, projectId, phase, engine, cliPath, key, pc, settings, reply, fresh, prev, run, logFile }) {
@@ -235,6 +420,9 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
   };
   let p = projects.loadProject(projectId);
   let finalEv = null;
+  const toolErrors = [];
+  const refusedWrites = [];
+  let drops = 0;
   let res = { code: -1 };
   let searchReady = null;
   let resumeId = null;
@@ -265,12 +453,18 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
       removeInside(p.folder, qFile);
     }
     resumeId = reply && !fresh && prev?.lastSession?.engine === engine ? prev.lastSession.sessionId : null;
-    const prompt = reply
+    const replyTask = decisionReplyTask(op.decisionReview, reply);
+    const prompt = (reply
       ? resumeId
         ? `The inventor answered your questions (also saved in ${LAYOUT.answers}):\n\n${reply}\n\nContinue the same phase. Remember the STATUS line at the end.`
         : `${phase.task}\n\nThe inventor has answered your earlier questions; the answers are in ${LAYOUT.answers} (latest at the bottom). Use them.`
-      : phase.task;
-    const systemText = `${skillText()}\n\n${statusProtocol(phase)}\n\nThis run is: ${phase.skillPhase}.`;
+      : phase.task) + replyTask;
+    // A draft made against a NO-GO is the inventor's decision; the AI drafts
+    // the strongest honest version and says so, without re-arguing it.
+    const against = phase.requiresGo && campaign.overruled(p.stamps?.decision)
+      ? `\n\nThe inventor chose to file against the NO-GO recommendation in ${LAYOUT.decision} (recorded in ${LAYOUT.answers}). That decision is theirs. Do not re-argue it or refuse the work. Build on the narrowest clean ground in ${LAYOUT.sweep} and ${LAYOUT.decision}, keep the claims honest about the prior art found, and where a report summarises the campaign, state plainly that it was drafted against the AI's recommendation. Later steps may still stop with STATUS: no-go if the draft itself fails.`
+      : '';
+    const systemText = `${skillText()}\n\n${statusProtocol(phase)}\n\n${folderRule(p.folder)}\n\nThis run is: ${phase.skillPhase}.${against}`;
 
     if (op.cancelled) throw Object.assign(new Error('Step stopped. Select Run again to restart.'), { stopped: true });
     const materials = (p.intake?.materials || []).filter((m) => m && existsSync(m));
@@ -279,18 +473,57 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
     if (phaseId === 'mining') {
       for (const line of await saveGitHistory(p.folder, materials, LAYOUT.gitHistoryDir)) say('gate', line);
     }
-    const handle = runEngine(
-      { engine, cliPath, pcPath: pc, repoRoot: REPO_ROOT, appDataDir: app.getPath('userData'), cwd: p.folder, systemText, prompt, resumeId, settings, key, serverEnv: searchEnv(), readDirs: materials },
-      (ev) => {
-        if (ev.kind === 'final') finalEv = ev;
-        projects.appendRunLog(logFile, { t: Date.now(), ...ev });
-        send('run:event', { projectId, phaseId, ev });
+    // PDF and Word material gets text copies every AI can read (Claude Code
+    // needs Poppler for PDFs, which most Windows computers lack).
+    for (const line of await saveMaterialText(p.folder, materials, LAYOUT.materialText, toolsPython(pc))) say('gate', line);
+    // An internet drop is not the inventor's problem: the app keeps hold of
+    // the step, waits for the connection, and continues the same
+    // conversation (this attempt's own, never an older one).
+    const freshPrompt = (reply ? `${phase.task}\n\nThe inventor has answered your earlier questions; the answers are in ${LAYOUT.answers} (latest at the bottom). Use them.` : phase.task) + replyTask;
+    const host = family(engine) === 'claude' ? 'api.anthropic.com' : 'chatgpt.com';
+    let promptNow = prompt;
+    let resumeNow = resumeId;
+    for (;;) {
+      finalEv = null;
+      toolErrors.length = 0;
+      const handle = runEngine(
+        { engine, cliPath, pcPath: pc, repoRoot: REPO_ROOT, appDataDir: app.getPath('userData'), cwd: p.folder, systemText, prompt: promptNow, resumeId: resumeNow, settings, key, serverEnv: searchEnv(), readDirs: materials },
+        (ev) => {
+          if (ev.kind === 'final') finalEv = ev;
+          if (ev.kind === 'error') toolErrors.push(String(ev.text || '').slice(0, 2000));
+          if (ev.kind === 'toolResult' && ev.ok === false && /requested permissions to write/i.test(ev.text || '')) refusedWrites.push(String(ev.text).match(/write to (.+?), but/)?.[1] || '');
+          projects.appendRunLog(logFile, { t: Date.now(), ...ev });
+          send('run:event', { projectId, phaseId, ev });
+        }
+      );
+      op.stop = handle.stop;
+      setStage(projectId, op, 'ai');
+      res = await handle.done;
+      op.stop = null;
+      const failed = res.code !== 0 || !finalEv || finalEv.ok === false;
+      const failText = [finalEv && finalEv.ok === false ? finalEv.text : '', ...toolErrors].join('\n');
+      if (!failed || op.cancelled || res.signal || !NET_DROP.test(failText)) break;
+      if (drops >= MAX_DROP_RETRIES) {
+        op.netFailed = true;
+        break;
       }
-    );
-    op.stop = handle.stop;
-    setStage(projectId, op, 'ai');
-    res = await handle.done;
-    op.stop = null;
+      drops++;
+      run.drops = drops;
+      say('warn', 'The internet connection dropped. The step continues by itself when the connection is back.');
+      setStage(projectId, op, 'waiting-network');
+      const before = filesNow(projectId);
+      if (!(await waitForNetwork(host, op))) {
+        if (op.cancelled) break;
+        op.netFailed = true;
+        break;
+      }
+      // Work done before the drop judged the files as they were then. If they
+      // changed while the app waited, it cannot be continued honestly.
+      if (filesNow(projectId) !== before) throw new Error('Your files changed while the app waited for the internet. Run this step again.');
+      say('gate', 'Connection is back. Continuing the step.');
+      resumeNow = res.sessionId || null;
+      promptNow = resumeNow ? 'The internet connection dropped and has come back. Continue the same phase from where you stopped. Check which files you already changed before redoing anything. Remember the STATUS line at the end.' : freshPrompt;
+    }
     setStage(projectId, op, 'checks-after');
   } catch (err) {
     appError = err;
@@ -307,7 +540,7 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
     st.reason = appError.message;
   } else if (res.code !== 0 || res.signal || op.cancelled || (finalEv && finalEv.ok === false)) {
     state = 'error';
-    st.reason = res.signal || op.cancelled ? 'Step stopped. Select Run again to restart.' : finalEv && finalEv.ok === false ? `The AI reported an error (${finalEv.subtype || 'error'}). Read the run details.` : `The AI stopped with an error (code ${res.code}). Read the run details.`;
+    st.reason = op.netFailed && !op.cancelled ? 'The internet connection kept dropping. Select Run again when it is steady.' : res.signal || op.cancelled ? 'Step stopped. Select Run again to restart.' : finalEv && finalEv.ok === false ? `The AI reported an error (${finalEv.subtype || 'error'}). Read the run details.` : `The AI stopped with an error (code ${res.code}). Read the run details.`;
   } else {
     // The Word copies are the app's job, made from the Markdown copies the AI
     // assembled, before anything asks whether the package is complete.
@@ -355,12 +588,52 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
       st.reason = `The AI recommended stopping but did not save its reasons (${LAYOUT.noGo}). Run step 6 again.`;
     }
     if (state === 'unknown') state = gone.length ? 'error' : 'done-unconfirmed';
+    // A save the app refused because it pointed outside the invention folder
+    // is the AI's mistake, not a setting the inventor can change.
+    const outside = refusedWrites.filter((w) => w && !path.resolve(w).startsWith(path.resolve(p.folder) + path.sep));
+    if (outside.length && state !== 'done' && state !== 'done-unconfirmed') {
+      state = 'error';
+      st.reason = 'The AI tried to save its work outside this invention\'s folder, which the app does not allow. Run this step again.';
+    }
     if ((state === 'done' || state === 'done-unconfirmed') && gone.length) {
       state = 'error';
       st.reason = `Required files or content are missing: ${gone.join('; ')}. Run this step again.`;
     }
     // "I need you" with no question written down is still a question: the
     // AI's own summary is shown as the thing to answer.
+  }
+
+  if (phaseId === 'decision') {
+    try {
+      if (op.decisionReview?.hash && (projects.linksIn(p, ['03-decision']).length || op.decisionReview.hash !== projects.fileHash(p, LAYOUT.secondOpinion))) throw new Error('The second opinion changed while the first AI reconsidered its recommendation. Run step 3 again.');
+      const decision = parseDecision(projects.readFile(p, LAYOUT.decision));
+      if (op.decisionReview && /^stop[.!]?$/i.test(reply.trim()) && state !== 'error' && (decision !== 'NO-GO' || !['done', 'no-go'].includes(state))) throw new Error('You chose to stop, but the AI did not write a completed NO-GO report. Run step 3 again.');
+      if (state === 'done-unconfirmed' && decision === 'GO') throw new Error('The AI did not confirm its filing recommendation was complete. Run step 3 again before getting a second opinion.');
+      if (state === 'done' && decision === 'GO') {
+        if (op.decisionReview?.verdict === 'DISAGREE') {
+          op.secondOpinion = 'DISAGREE-overridden';
+          op.secondOpinionHash = op.decisionReview.hash;
+        } else if (op.decisionReview?.verdict === 'unavailable' && op.decisionReview.continuedByInventor) {
+          op.secondOpinion = 'skipped-by-inventor';
+        } else {
+          op.decisionReview = await secondOpinion({ op, projectId, p, engine, pc, settings, logFile, say });
+          if (op.decisionReview.verdict === 'AGREE') {
+            op.secondOpinion = 'AGREE';
+            op.secondOpinionHash = op.decisionReview.hash;
+            say('gate', 'The second AI agrees with going ahead.');
+          } else {
+            state = 'needs-input';
+            st.reason = secondOpinionQuestion(p, op.decisionReview);
+            say('warn', st.reason);
+          }
+        }
+      }
+      if (op.cancelled) throw new Error('Step stopped. Select Run again to restart.');
+    } catch (err) {
+      state = 'error';
+      st.reason = err.message;
+      say('error', err.message);
+    }
   }
 
   const record = {
@@ -373,8 +646,9 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
     costUsd: finalEv?.costUsd ?? null,
     ms: Date.now() - Date.parse(run.at), // wall clock, including the app's own checks
     exitCode: res.code,
+    ...(phaseId === 'decision' ? { secondOpinion: op.secondOpinion || op.decisionReview?.verdict || null, secondOpinionEngine: op.decisionReview?.secondEngine, secondOpinionCostUsd: op.decisionReview?.costUsd ?? null } : {}),
   };
-  const lostConversation = !!resumeId && state === 'error' && !finalEv && !res.signal && !op.cancelled && !appError;
+  const lostConversation = !op.netFailed && !drops && !!resumeId && state === 'error' && !finalEv && !res.signal && !op.cancelled && !appError;
 
   try {
     if (phase.gatesAfter && state !== 'error') {
@@ -412,13 +686,14 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
       record.reason = 'The no-go report changed after the AI finished. Run step 6 again.';
     }
     const ph = rec.phases?.[phaseId] || {};
+    if (op.decisionReview) op.decisionReview.decisionHash = projects.fileHash(rec, LAYOUT.decision);
     rec.phases = {
       ...(rec.phases || {}),
-      [phaseId]: { ...ph, state, current: null, lastSession: res.sessionId ? { engine, sessionId: res.sessionId } : ph.lastSession, runs: [...(ph.runs || []), record].slice(-30) },
+      [phaseId]: { ...ph, ...(phaseId === 'decision' ? { decisionReview: op.decisionReview } : {}), state, current: null, lastSession: res.sessionId ? { engine, sessionId: res.sessionId } : ph.lastSession, runs: [...(ph.runs || []), record].slice(-30) },
     };
     // The stamp is taken last, after the app's own checks, from the files as
     // they are at this moment.
-    if (campaign.isFinished(state)) rec.stamps = { ...(rec.stamps || {}), [phaseId]: campaign.makeStamp(rec, phase, { state, engine, family: family(engine), at: record.endedAt, searchReady, basis: op.basis, afterAt: op.afterAt }) };
+    if (campaign.isFinished(state)) rec.stamps = { ...(rec.stamps || {}), [phaseId]: campaign.makeStamp(rec, phase, { state, engine, family: family(engine), at: record.endedAt, searchReady, basis: op.basis, afterAt: op.afterAt, secondOpinion: op.secondOpinion, secondOpinionHash: op.secondOpinionHash }) };
   });
   release(projectId);
   send('run:end', { projectId, phaseId, record });
@@ -543,16 +818,31 @@ handle('projects:openFile', (id, rel) => {
 handle('projects:runLog', (id, name) => projects.readRunLog(findProject(id), name));
 
 handle('run:start', (id, phaseId, opts) => runPhase(id, phaseId, opts || {}));
+handle('run:fixRound', (id) => startFixRound(id));
+// File anyway: the inventor overrules a NO-GO at step 3. Kept on step 3's own
+// record (a new step 3 result clears it) and written into the answers file.
+handle('decision:overrule', (id) => {
+  const p = findProject(id);
+  if (ops.has(id) || fixRounds.has(id)) throw new Error('This invention is busy. Wait for the current work to finish.');
+  const st = p.stamps?.decision;
+  if (campaign.evaluate(p).decision.status !== 'no-go' || st?.decision !== 'NO-GO') throw new Error('File anyway is only for a step 3 result that recommends not filing.');
+  const at = new Date().toISOString();
+  writeInside(p.folder, LAYOUT.answers, `\n## ${at.slice(0, 16).replace('T', ' ')} (step: Is it worth filing?)\n\n### The inventor's decision\n\nThe AI recommended not filing (${LAYOUT.decision}). I have read its reasons and I choose to file anyway. This is my decision.\n`, { append: true });
+  const updated = projects.update(id, (rec) => (rec.stamps.decision.overruledByInventor = { at, decisionHash: projects.fileHash(p, LAYOUT.decision) }));
+  return view(updated);
+});
 handle('run:stop', (id) => {
+  const fr = fixRounds.get(id);
+  if (fr) fr.cancelled = true;
   const op = ops.get(id);
-  if (!op) return false;
+  if (!op) return !!fr;
   // Before the AI starts this stops the step from starting; while it runs it
   // ends the AI's process. The app's closing checks are short and finish.
   op.cancelled = true;
   op.stop?.();
   // The app's own checks are stopped by hanging up on the patent tools; the
   // check in flight fails at once and no further one starts.
-  if (op.stage !== 'ai') gates.disconnect();
+  if (!['ai', 'second-opinion', 'waiting-network'].includes(op.stage)) gates.disconnect();
   return true;
 });
 
@@ -570,26 +860,84 @@ handle('law:search', async (query) => {
 });
 
 handle('setup:install', async () => {
-  // Installs the existing patent-creator package from this repo into the
-  // README's venv, then runs its own non-interactive setup. Python comes from
-  // uv (downloaded into the app's own folder), so the computer's own Python,
-  // or the lack of one, never matters.
+  // Installs the patent-creator package this app carries, then runs its own
+  // non-interactive setup (the rulebook index, which lives outside the
+  // package folder and survives every reinstall). Python comes from uv
+  // (downloaded into the app's own folder), so the computer's own Python, or
+  // the lack of one, never matters.
   await loginShellPath();
   const home = app.getPath('home');
-  const venv = path.join(home, 'patent-creator-venv');
   const isWin = process.platform === 'win32';
   const log = (l) => send('setup:line', l);
-  const vpy = path.join(venv, isWin ? 'Scripts' : 'bin', isWin ? 'python.exe' : 'python');
-  const pc = path.join(venv, isWin ? 'Scripts' : 'bin', isWin ? 'patent-creator.exe' : 'patent-creator');
+  const bin = (venv, name) => path.join(venv, isWin ? 'Scripts' : 'bin', isWin ? `${name}.exe` : name);
+  const pyOk = async (py) => {
+    const v = await pythonVersion(py);
+    return !!v && (!MIN_TOOLS_PYTHON || compareVersions(v, MIN_TOOLS_PYTHON) >= 0);
+  };
+
+  // 1. Never replace a developer's linked (editable) copy. An old one is
+  //    theirs to update; a current one only gets its rulebook prepared.
+  const found = (await env(true)).patentCreator;
+  if (found?.editable && found.outdated) throw new Error('These patent tools are a development copy linked to a source folder. Update that folder instead.');
+
+  // 2. Where to install. The copy the app found is updated where it is when
+  //    it sits in a virtual environment the app can identify and its Python
+  //    is new enough for the version being installed. Anything else (a system
+  //    or pipx install, a stale saved path, a Python too old) gets the app's
+  //    usual folder instead, and the app switches to that copy.
+  let venv;
+  let vpy;
+  let pc;
+  let target = null; // what is installed at the chosen place, if anything
+  if (found?.installed && found.inPlace && (await pyOk(found.python))) {
+    vpy = found.python;
+    venv = path.dirname(path.dirname(vpy));
+    pc = found.path;
+    target = found;
+  } else {
+    venv = path.join(home, 'patent-creator-venv');
+    vpy = bin(venv, 'python');
+    pc = bin(venv, 'patent-creator');
+    if (existsSync(vpy)) target = await pythonToolsVersion(vpy);
+    if (target?.editable && compareVersions(target.version, BUNDLED_TOOLS_VERSION) < 0) {
+      throw new Error(`The patent tools in ${venv} are a development copy linked to a source folder. Update that folder instead.`);
+    }
+  }
+  // The usual folder is rebuilt with a current Python when the one there is
+  // too old for this version (installs from before August 2026 allowed 3.9).
+  const rebuildPython = existsSync(vpy) && !target?.editable && !(await pyOk(vpy));
+  if (rebuildPython && vpy !== bin(venv, 'python')) throw new Error('The patent tools folder has a Python that is too old. Select Install again.');
+
+  // 3. Nothing may be running on the tools while they are replaced.
+  if (ops.size || fixRounds.size) throw new Error('A step is running. Let it finish or stop it, then update the patent tools.');
+  // The app's own checks hold the tools open; close them first.
+  await gates.disconnect();
+  // Windows will not replace a program another window is running (another
+  // Studio, or Claude Code using the tools), and a half-finished replacement
+  // leaves a broken install, so the update waits until nothing runs from it.
+  if (isWin && existsSync(venv)) {
+    const running = await processesRunningFrom(venv);
+    if (running?.length) {
+      throw new Error(`The patent tools are open in another program (${running.length === 1 ? 'one program' : `${running.length} programs`}: another Patent Creator Studio window, or Claude Code). Close it, then select Update again.`);
+    }
+  }
+
+  // 4. A copy that is current or newer, or any linked copy, is kept; only
+  //    setup runs.
+  // A missing launcher means the install is damaged, so it is reinstalled;
+  // a linked copy is repaired from its own source folder, never replaced.
+  if (target?.editable && !existsSync(pc)) throw new Error(`The development copy in ${venv} is missing its patent-creator command. Reinstall it from its source folder.`);
+  const keepPackage = !rebuildPython && existsSync(pc) && !!(target?.version && (target.editable || compareVersions(target.version, BUNDLED_TOOLS_VERSION) >= 0));
   log('▸ Downloading the Python installer');
   const uv = await installers.ensureUv(path.join(app.getPath('userData'), 'tools'), log);
   const steps = [];
-  if (!existsSync(vpy)) steps.push([uv, ['venv', '--python', '3.12', venv], 'Installing Python in the patent tools folder']);
+  if (!existsSync(vpy) || rebuildPython) steps.push([uv, ['venv', '--clear', '--python', '3.12', venv], rebuildPython ? 'Replacing the old Python in the patent tools folder (graphics card support downloads again, which can take several minutes)' : 'Installing Python in the patent tools folder']);
   // uv makes Python without pip, and setup uses pip to swap in the PyTorch
   // build for the graphics card; without it the rulebook builds on the CPU.
   steps.push([uv, ['pip', 'install', '--python', vpy, 'pip'], 'Preparing Python for graphics card support']);
-  steps.push([uv, ['pip', 'install', '--python', vpy, REPO_ROOT], 'Installing the patent tools (a minute or two)']);
-  steps.push([pc, ['setup', '--non-interactive'], 'Preparing the patent rulebook search (5 to 45 minutes)']);
+  // --reinstall-package replaces an older copy even when pip would call it satisfied.
+  if (!keepPackage) steps.push([uv, ['pip', 'install', '--python', vpy, '--reinstall-package', 'claude-patent-creator', REPO_ROOT], found?.outdated ? `Updating the patent tools to ${BUNDLED_TOOLS_VERSION} (a minute or two)` : 'Installing the patent tools (a minute or two)']);
+  steps.push([pc, ['setup', '--non-interactive'], found?.ready ? 'Checking the patent rulebook search' : 'Preparing the patent rulebook search (5 to 45 minutes)']);
   for (const [cmd, args, label] of steps) {
     log(`▸ ${label}`);
     const r = await streamCommand(cmd, args, { onLine: log, env: childEnv() });
@@ -597,16 +945,16 @@ handle('setup:install', async () => {
     // The tools' own setup ends by registering itself with Claude Code. This
     // app hands the tools to each AI on every run, so that last part is not
     // needed: what counts is that the rulebook index is built.
-    if (args[0] === 'setup') {
-      envCache = null;
-      const now = await env(true);
-      if (now.patentCreator?.ready) {
-        log('▸ Rulebook search is ready.');
-        continue;
-      }
+    // Asks the install just made, not whatever a saved path points at.
+    if (args[0] === 'setup' && (await toolsStatusReady(pc))) {
+      log('▸ Rulebook search is ready.');
+      continue;
     }
     throw new Error(`${label} failed (code ${r.code}). Read the setup log for the cause.`);
   }
+  // A saved path to some other copy would keep the app on that copy.
+  const saved = loadSettings().patentCreatorPath;
+  if (saved && path.resolve(saved) !== path.resolve(pc)) saveSettings({ patentCreatorPath: pc });
   envCache = null;
   return env(true);
 });

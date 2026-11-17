@@ -113,8 +113,25 @@ except ImportError:
 from downloaders import FileDownloader
 from mpep_search import MPEPIndex
 
-# Initialize MCP server
-mcp = MCPServer("claude-patent-creator")
+
+def _own_version() -> str:
+    """The version of this copy, from the _version.py beside this file (loaded
+    by path, so another installed copy on sys.path never answers)."""
+    import importlib.util
+    from pathlib import Path as _Path
+
+    spec = importlib.util.spec_from_file_location(
+        "_patent_creator_version", _Path(__file__).resolve().with_name("_version.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.load_version(__file__)
+
+
+_version = _own_version()
+
+# Initialize MCP server. The version reaches clients in the MCP handshake (serverInfo.version).
+mcp = MCPServer("claude-patent-creator", version=_version)
 
 # Initialize logger
 logger = get_logger()
@@ -348,6 +365,7 @@ from tools.package_tools import register_package_tools  # noqa: E402
 from tools.patent_law_tools import register_patent_law_tools  # noqa: E402
 from tools.system_tools import register_system_tools  # noqa: E402
 from tools.uspto_search_tools import register_uspto_tools  # noqa: E402
+from tools.web_history_tools import register_web_history_tools  # noqa: E402
 
 
 def _register_all_tools():
@@ -442,6 +460,13 @@ def _register_all_tools():
         log_error=_log_error,
         validate_input=validate_input,
         SearchGooglePatentsInput=SearchGooglePatentsInput,
+        track_performance=track_performance,
+    )
+
+    register_web_history_tools(
+        mcp=mcp,
+        log_info=_log_info,
+        log_error=_log_error,
         track_performance=track_performance,
     )
 

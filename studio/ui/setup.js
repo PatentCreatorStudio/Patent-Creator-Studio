@@ -29,6 +29,40 @@ async function toolAction(name, act) {
   renderSidebar();
 }
 
+// The patent tools: install, update an older copy, or say they are ready.
+function toolsItem(t, item) {
+  const busy = state.installing;
+  const button = (label, busyLabel) =>
+    `<button class="btn primary" id="install" ${busy ? 'disabled' : ''}>${busy ? busyLabel : label}</button>`;
+  if (t.outdated) {
+    return t.canUpdate
+      ? item(
+          false,
+          'Patent tools',
+          `Out of date: ${t.version ? `version ${esc(t.version)} is installed` : 'the installed version cannot be read'} and this app needs ${esc(t.neededVersion)}. Update installs the new version and keeps the rulebook. It takes a few minutes, longer when it must replace an old Python and download graphics card support again.`,
+          button('Update', 'Updating…')
+        )
+      : item(
+          false,
+          'Patent tools',
+          `A development copy at version ${esc(t.version || 'unknown')} is linked here; this app needs ${esc(t.neededVersion)}. Update the source folder, then select Check again. <span class="muted small">${esc(t.path)}</span>`
+        );
+  }
+  if (t.ready) {
+    return item(
+      true,
+      'Patent tools',
+      `Ready, version ${esc(t.version || '?')} (${esc(t.chunks || '?')} searchable rulebook passages). <span class="muted small">${esc(t.path)}</span>`
+    );
+  }
+  return item(
+    false,
+    'Patent tools',
+    t.installed ? 'Installed. Select Install to prepare the rulebook search.' : 'Install downloads the patent tools, Python and the rulebook. Allow 5 to 45 minutes.',
+    button('Install', 'Installing…')
+  );
+}
+
 export function renderSetup() {
   const e = state.env;
   const k = state.settings?.keys || {};
@@ -40,16 +74,7 @@ export function renderSetup() {
       !e
         ? '<div class="card muted">Checking installed tools…</div>'
         : `<div class="card">
-      ${item(
-        e.patentCreator.ready,
-        'Patent tools',
-        e.patentCreator.ready
-          ? `Ready (${esc(e.patentCreator.chunks || '?')} searchable rulebook passages). <span class="muted small">${esc(e.patentCreator.path)}</span>`
-          : e.patentCreator.installed
-            ? 'Installed. Select Install to prepare the rulebook search.'
-            : 'Install downloads the patent tools, Python and the rulebook. Allow 5 to 45 minutes.',
-        e.patentCreator.ready ? '' : `<button class="btn primary" id="install" ${state.installing ? 'disabled' : ''}>${state.installing ? 'Installing…' : 'Install'}</button>`
-      )}
+      ${toolsItem(e.patentCreator, item)}
       ${aiItem('claude', 'Claude Code', e.claude, e.codex.loggedIn, e.claude.authMethod === 'claude.ai' ? ' with your Claude subscription' : '', 'Use your Claude subscription, or add an Anthropic API key in Settings.')}
       ${aiItem('codex', 'Codex', e.codex, e.claude.loggedIn, '', 'Use your ChatGPT subscription, or add an OpenAI API key in Settings.')}
       ${state.loginCode ? `<div class="check-item"><div class="ci-icon">🔑</div><div><b>Finish signing in to Claude</b><p>Sign in in your browser, then paste the code shown there.</p><div class="row"><input id="login-code" placeholder="Paste the code here" style="flex:1"><button class="btn primary" id="login-send">Finish sign-in</button></div></div><div></div></div>` : ''}
@@ -79,10 +104,10 @@ export function renderSetup() {
     renderSetup();
     const r = await guard(() => S.install());
     state.installing = false;
-    if (r) ((state.env = r), toast('The patent tools are installed.'));
+    if (r) ((state.env = r), toast(r.patentCreator?.outdated ? 'The patent tools are still out of date. Read the setup log.' : 'The patent tools are ready.'));
     renderSetup();
   });
-  if (e?.patentCreator.ready) {
+  if (e?.patentCreator.ready && !e.patentCreator.outdated) {
     const box = $('#search-item');
     box.innerHTML = item('opt', 'Patent search', 'Checking…');
     S.searchStatus()
@@ -91,7 +116,7 @@ export function renderSetup() {
           st.ready ? true : false,
           'Patent search',
           st.ready
-            ? `On${st.google?.ready ? ` (Google Patents, ${esc(st.google.searches_left ?? '?')} searches left this month on ${esc(st.google.plan || '')})` : ' (BigQuery)'}.`
+            ? `On${st.google?.ready ? ` (Google Patents, ${esc(st.google.searches_left ?? '?')} searches left on ${esc(st.google.plan || 'your SerpApi account')})` : ' (BigQuery)'}.`
             : 'Off. To assess whether filing is worth pursuing, add a <a href="https://serpapi.com/users/sign_up">SerpApi search key</a> in Settings.'
         );
       })

@@ -40,11 +40,13 @@ it cost something in that campaign.
 ## Phase 0 — Intake (any raw material)
 
 Accept the rough ask as-is. If the material is a codebase, do NOT ask for a
-disclosure — mining is Phase 1's job. Ask only what cannot be derived:
-inventor name(s), and whether any of it has been publicly disclosed or sold
-(statutory bar dates). Then AUDIT the inventor's own public footprint —
-released products, demos, public repositories, marketing pages — and record
-first-disclosure dates: the inventor's own disclosures start the US
+disclosure — mining is Phase 1's job. Find facts before asking for them:
+inventor names, filings and dates are often already in the material. Ask
+only what nothing you can reach establishes: inventor name(s), and whether
+any of it has been publicly disclosed or sold (statutory bar dates). Then
+AUDIT the inventor's own public footprint — released products, demos, public
+repositories, marketing pages — and record first-disclosure dates (date web
+pages with `check_web_history`, which reads the Internet Archive directly): the inventor's own disclosures start the US
 grace-period clock and can immediately forfeit foreign rights. Do this
 before drafting, not after.
 
@@ -133,9 +135,13 @@ Patents alone are NOT sufficient for software: the killing art usually
 lives in products, open source, standards, and papers. Sweep ALL of:
 
 1. **Patents**: `search_patents_google` (full text worldwide, claims
-   included; all words must match, so lead with distinctive terms; add
-   `CPC=G06F16/00`-style terms to stay inside a class), Google Patents pages
-   for deep reads (free). Fallback without a SerpApi key:
+   included; all words must match, so use 2-5 distinctive terms per query),
+   Google Patents pages for deep reads (free). **Class searches are
+   required, and need no BigQuery:** take the CPC groups of the closest
+   patents found and run `search_patents_google` with `CPC=<code>` alone
+   and with 2-4 keywords (e.g. `CPC=G06F40/166 anchor`). Write `CPC=`
+   exactly; `cpc:` silently finds almost nothing through this API. Never
+   report class search as unavailable while Google Patents is ready. Fallback without a SerpApi key:
    `search_patents_bigquery` and `search_patents_by_cpc_bigquery`, but a
    keyword search there scans ~341 GiB (about $2, a third of a free month).
    If neither is set up (`check_google_patents_status` and

@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const BETA = 'RobThePCGuy/Patent-Creator-Studio-Beta';
+const BETA = 'PatentCreatorStudio/Patent-Creator-Studio-Beta';
 const AUTHOR = { name: 'RobThePCGuy', email: '10876982+RobThePCGuy@users.noreply.github.com' };
 const tag = process.argv[2];
 if (!/^v\d+\.\d+\.\d+(-[\w.]+)?$/.test(tag || '')) throw new Error('Give a tag like v0.1.0-beta.6');
@@ -22,7 +22,7 @@ const env = {
   GIT_COMMITTER_NAME: AUTHOR.name, GIT_COMMITTER_EMAIL: AUTHOR.email,
 };
 
-execFileSync('gh', ['repo', 'clone', BETA, work], { stdio: 'inherit' });
+execFileSync('git', ['clone', '-q', `https://github.com/${BETA}.git`, work], { stdio: 'inherit' });
 // The first export replaces GitHub's starter commit so the history begins clean.
 const first = !git(work, 'tag', '--list');
 if (first) git(work, 'checkout', '-q', '--orphan', 'clean');

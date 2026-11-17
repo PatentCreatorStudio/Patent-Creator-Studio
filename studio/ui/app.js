@@ -29,7 +29,7 @@ export async function renderSidebar() {
   if (e) $('#setup-dot').className = 'dot ' + (toolsReady(e) ? 'good' : 'warn');
 }
 
-const toolsReady = (e) => e.patentCreator.ready && ((e.claude.installed && e.claude.loggedIn) || (e.codex.installed && e.codex.loggedIn));
+const toolsReady = (e) => e.patentCreator.ready && !e.patentCreator.outdated && ((e.claude.installed && e.claude.loggedIn) || (e.codex.installed && e.codex.loggedIn));
 
 document.querySelectorAll('.navlink').forEach((b) => (b.onclick = () => go(b.dataset.view)));
 $('#new-btn').onclick = () => intakeModal();

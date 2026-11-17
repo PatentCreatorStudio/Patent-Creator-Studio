@@ -1,7 +1,7 @@
 // The steps tab: the list of steps, the panel for the chosen step, and the
 // live feed of what the AI is doing. What each step's status is, and whether
 // it may run, comes from the app (project.steps); nothing is worked out here.
-import { S, $, state, esc, md, toast, guard, ago, engineFamily, engineAvailable, familyName } from './core.js';
+import { S, $, state, esc, md, toast, guard, ago, fmtDate, engineFamily, engineAvailable, familyName } from './core.js';
 import { renderProject, showProject } from './project.js';
 
 const WORDS = {
@@ -100,13 +100,24 @@ function renderPhasePanel(el) {
         mine
           ? p.busy.stage === 'checks-after'
             ? '<button class="btn" disabled>Finishing checks…</button>'
-            : '<button class="btn danger" id="stop">Stop</button>'
+            : `<button class="btn danger" id="stop">Stop</button>${p.busy.stage === 'waiting-network' ? '<span class="muted small">Waiting for the internet to come back. The step continues by itself.</span>' : ''}`
           : `<button class="btn primary" id="run" ${busy ? 'disabled' : ''}>${step.status === 'todo' ? 'Run this step' : 'Run again'}</button>`
       }
       ${busy && !mine ? `<span class="muted small">${p.running ? 'Another step is running for this invention.' : "The app's checks are running."}</span>` : ''}
     </div>`
     }
     ${last ? lastRunBox(last) : ''}
+    ${
+      ph.id === 'decision' && step.status === 'no-go'
+        ? p.stamps?.decision?.overruledByInventor
+          ? `<div class="summary-box attention"><b>You chose to file anyway</b> on ${esc(fmtDate(new Date(p.stamps.decision.overruledByInventor.at)))}. Drafting is open. The record and the final status say it was drafted against the AI's recommendation. Running this step again clears the choice.</div>`
+          : `<div class="card" style="margin-top:14px">
+              <h3>Still want to file?</h3>
+              <p class="small">The AI recommends not filing. Filing is your decision. If you go ahead, every check and the second AI's review still run, and the record and final status say it was drafted against this recommendation.</p>
+              <div class="row" style="margin-top:8px"><button class="btn" id="overrule" ${busy ? 'disabled' : ''}>File anyway</button></div>
+            </div>`
+        : ''
+    }
     ${
       needsInput
         ? `<div class="card" style="margin-top:14px">
@@ -118,7 +129,7 @@ function renderPhasePanel(el) {
         : ''
     }
     <div class="outputs">
-      ${ph.outputs
+      ${[...ph.outputs, ...(ph.optionalOutputs || [])]
         .map((o) => {
           const have = p.files.some((f) => f.path === o);
           return `<button class="file-chip ${have ? '' : 'missing'}" data-file="${esc(o)}" ${have ? '' : 'disabled'} title="${have ? 'Open' : 'Not written yet'}">${esc(o)}</button>`;
@@ -132,6 +143,7 @@ function renderPhasePanel(el) {
   if (sel) sel.onchange = () => (state.engineChoice = { ...(state.engineChoice || {}), [ph.id]: sel.value });
   $('#run', el)?.addEventListener('click', () => startRun(ph.id, sel.value));
   $('#stop', el)?.addEventListener('click', () => guard(() => S.stop(p.id)));
+  $('#overrule', el)?.addEventListener('click', () => overruleDialog(p));
   $('#send-reply', el)?.addEventListener('click', () => {
     const reply = $('#reply', el).value.trim();
     if (!reply) return toast('Write your answers first.', true);
@@ -154,6 +166,29 @@ function renderPhasePanel(el) {
       if (feed.isConnected) state.feeds[feedKey].forEach((ev) => appendEv(feed, ev));
     });
   }
+}
+
+// Shows the AI's own summary before the inventor confirms, so the choice is
+// made with the reasons in front of them.
+async function overruleDialog(p) {
+  const text = (await guard(() => S.readFile(p.id, '03-decision/decision.md'))) || '';
+  const m = text.match(/##\s*Plain-English summary[\s\S]*?(?=\n##\s|\n---|$)/i);
+  const summary = (m ? m[0] : text.split('\n').slice(0, 40).join('\n')).slice(0, 6000);
+  const root = $('#modal-root');
+  root.innerHTML = `<div class="modal-back"><div class="modal" role="dialog" aria-label="File anyway">
+    <h2>File anyway?</h2>
+    <p class="muted">The AI's reasons for recommending not filing:</p>
+    <div class="doc" style="max-height:45vh;overflow:auto;margin-top:8px">${md(summary)}</div>
+    <label class="row" style="margin-top:14px;gap:8px"><input type="checkbox" id="ov-read"> I have read the reasons and I choose to file anyway.</label>
+    <div class="actions"><button class="btn ghost" id="ov-cancel">Cancel</button><button class="btn primary" id="ov-ok" disabled>File anyway</button></div>
+  </div></div>`;
+  $('#ov-read').onchange = (e) => ($('#ov-ok').disabled = !e.target.checked);
+  $('#ov-cancel').onclick = () => (root.innerHTML = '');
+  $('#ov-ok').onclick = async () => {
+    const r = await guard(() => S.overrule(p.id));
+    root.innerHTML = '';
+    if (r) (toast('Drafting is open. The record says this was your decision.'), showProject(r));
+  };
 }
 
 function lastRunBox(last) {

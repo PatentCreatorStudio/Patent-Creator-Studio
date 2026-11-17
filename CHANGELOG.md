@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-17
+
+### Fixed
+- Patent-class (CPC) searches no longer need BigQuery. `search_patents_google`
+  accepts `CPC=<code>` (child classes included), verified live; `cpc:` is
+  matched as plain text through SerpApi and finds almost nothing, so the tool
+  says so. The BigQuery CPC tool points to this route when BigQuery is not
+  set up, and the campaign, prior-art skill, searcher agent and command no
+  longer say class searches need BigQuery. A real sweep had run 24 keyword
+  searches and no class search, reporting class search unavailable.
+- Query guidance: 2-5 terms per query, since every word must match.
+
+## [0.3.1] - 2026-11-17
+
+### Added
+- `check_web_history`: when a web page was first public, from the Internet
+  Archive's capture index. Disclosure audits can date the inventor's own
+  pages without a manual Wayback Machine lookup; web fetch tools are often
+  refused by web.archive.org.
+
+### Changed
+- The campaign skill's intake finds facts in the material before asking the
+  inventor for them.
+
+## [0.3.0] - 2026-11-15
+
+This version collects everything merged since 0.2.0. From here on, every
+change to the installed tools raises the version (CI enforces it) and each
+version gets a release tag, so an installed copy can tell whether it is
+current: `patent-creator --version`, `mcp_server.__version__` and the MCP
+handshake's server version all report it, from `pyproject.toml` alone.
+
+### Fixed (since #126)
+- Google Patents readiness counts extra SerpApi credits, not only the
+  monthly plan (#127).
+- Diagram labels: subscripts, zero offsets, kerning, Graphviz styled runs
+  and table cells read as drawn, so reference numbers land (#127).
+- Multiple-dependent claims ("any one of claims 1 or 2") check every parent
+  for support and antecedent basis; measurements and counts after a claim
+  reference are not read as claim numbers (#127).
+
 ### Added
 - `search_non_patent_literature`: papers and preprints as prior art, from
   OpenAlex, arXiv and Semantic Scholar at once, free with no key. Filters by

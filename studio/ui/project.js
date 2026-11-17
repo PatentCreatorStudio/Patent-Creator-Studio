@@ -25,7 +25,7 @@ export async function refreshProject() {
   const id = state.projectId;
   if (state.view !== 'project' || !id || document.querySelector('#reply')?.value || document.querySelector('.modal')) return;
   const np = await S.project(id).catch(() => null);
-  if (np && JSON.stringify([np.steps, np.readiness, np.files, np.busy]) !== JSON.stringify([state.project?.steps, state.project?.readiness, state.project?.files, state.project?.busy])) showProject(np, { keepFeedScroll: true });
+  if (np && JSON.stringify([np.steps, np.readiness, np.files, np.busy, np.fixing]) !== JSON.stringify([state.project?.steps, state.project?.readiness, state.project?.files, state.project?.busy, state.project?.fixing])) showProject(np, { keepFeedScroll: true });
 }
 window.addEventListener('focus', refreshProject);
 
@@ -47,6 +47,7 @@ export function renderProject() {
         <div class="b-label">${esc(r.label)}</div>
         <div>${esc(r.detail)}</div>
         ${r.missing?.length ? `<ul>${r.missing.map((m) => `<li>${esc(m)}</li>`).join('')}</ul>` : ''}
+        ${p.fixing ? `<div class="row"><span class="muted">${esc(p.fixing)}</span><button class="btn" id="fix-stop">Stop</button></div>` : r.fixRound && !p.busy ? '<div class="row"><button class="btn primary" id="fix-round">Fix and review again</button><span class="muted small">Runs steps 6, 7 and 8 again until the review passes, up to 3 rounds. About 25 minutes a round.</span></div>' : ''}
       </div>
     </div>
     ${clocks(p)}
@@ -67,6 +68,10 @@ export function renderProject() {
     S.openFolder(p.id);
   };
   $('#edit-intake').onclick = () => intakeModal(p);
+  const fixBtn = $('#fix-round');
+  if (fixBtn) fixBtn.onclick = () => guard(() => S.fixRound(p.id)).then(refreshProject);
+  const fixStop = $('#fix-stop');
+  if (fixStop) fixStop.onclick = () => guard(() => S.stop(p.id)).then(refreshProject);
   document.querySelectorAll('.tab').forEach((t) => (t.onclick = () => ((state.tab = t.dataset.tab), renderProject(), refreshProject())));
   document.querySelectorAll('[data-date]').forEach((inp) => {
     inp.onchange = async () => {

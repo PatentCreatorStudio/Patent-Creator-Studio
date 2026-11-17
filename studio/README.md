@@ -30,7 +30,9 @@ xattr -dr com.apple.quarantine "/Applications/Patent Creator Studio.app"
 1. Download the `Setup` `.exe` file and run it.
 2. Windows SmartScreen says it protected your PC, because the installer isn't signed with a paid certificate. Select **More info**, then **Run anyway**.
 
-The app installs for your account only and needs no administrator rights.
+The app installs for your account only and needs no administrator rights. It needs Windows 10 (version 1809) or newer. Setup installs everything else, including its own copy of Python. Git is optional: without it, step 1 skips reading a code project's history. Graphviz is optional too.
+
+Claude Code needs a paid Claude plan (Pro or higher) or an API key. The free plan doesn't include it.
 
 ### First run
 
@@ -53,7 +55,7 @@ Build the installers with `npm run dist:mac` (on a Mac) or `npm run dist:win`. O
 | 0 | Your idea and its public history | `00-intake/disclosure-audit.md` |
 | 1 | Identify ideas to investigate | `01-mining/candidates.md` |
 | 2 | Search for anything like it | `02-prior-art/sweep.md` |
-| 3 | Is it worth filing? | `03-decision/decision.md` |
+| 3 | Is it worth filing? | `03-decision/decision.md`, plus `03-decision/second-opinion.md` when the first AI recommends continuing |
 | 4 | Write the claims | `04-claims/claims.md` |
 | 5 | Write the description and drawings | `05-spec/` |
 | 6 | Check and fix the draft | `06-verify/` |
@@ -61,6 +63,8 @@ Build the installers with `npm run dist:mac` (on a Mac) or `npm run dist:win`. O
 | 8 | Review with a second AI | `07-red-team/` |
 
 When a step needs your input, answer in the app. Your answers are saved in `00-intake/inventor-answers.md` before the step continues.
+
+At step 3, a recommendation to continue gets an independent second opinion from the other AI before drafting starts. It runs its own searches and checks whether filing is worth the money. Allow about 20 to 45 minutes when a second opinion is needed. If the AIs disagree, read both reports and reply "continue" to draft anyway, "stop" to finish with a not-worth-filing result, or answer the concerns raised. The first AI weighs your reply and rewrites its recommendation; the second opinion does not run again for that reply. If the other AI is unavailable, set it up in Setup or reply "continue" to proceed on one AI's recommendation. The app records that choice. Drafting stays locked until step 3 is resolved, and changing or removing the second opinion requires step 3 to run again.
 
 Each step builds on the previous result. Changing the idea or repeating an earlier step can require later steps to run again. The app shows the reason.
 
@@ -102,4 +106,6 @@ These are the recorded results from November 12 and 13, 2026, not a fresh test o
 
 Probed against the real code earlier: forged records ignored, `RED TEAM: FAIL` with "PASS" in the body stays FAIL, symlink and `../` escapes refused, deleting a filing file invalidates its package check, a non-zero exit after a final result is an error, a printed API key is masked, navigation to an AI-written HTML file is refused, writes outside the folder are refused.
 
-Not yet exercised: the two API-key options with real keys, Codex as the writer with Claude attacking, the Windows build, and the in-app installer on a machine without the patent tools.
+Windows, November 13 and 14: the installer runs without administrator rights, Setup installs the patent tools with graphics card support, and a test invention ran steps 0 to 3 to a no-go with Codex and Claude. Closing the app mid-step and reopening it recovers.
+
+Not yet exercised: the two API-key options with real keys, Codex as the writer with Claude attacking, steps 4 to 8 on Windows, and a computer that has never had Claude Code or Codex installed.

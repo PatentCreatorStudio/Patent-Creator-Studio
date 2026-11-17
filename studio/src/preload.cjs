@@ -24,6 +24,8 @@ contextBridge.exposeInMainWorld('studio', {
   runLog: (id, rel) => call('projects:runLog', id, rel),
   run: (id, phaseId, opts) => call('run:start', id, phaseId, opts),
   stop: (id) => call('run:stop', id),
+  fixRound: (id) => call('run:fixRound', id),
+  overrule: (id) => call('decision:overrule', id),
   draftGates: (id) => call('gates:draft', id),
   packageGate: (id) => call('gates:package', id),
   searchStatus: () => call('gates:search'),

@@ -7,8 +7,10 @@ export const LAYOUT = {
   audit: '00-intake/disclosure-audit.md',
   candidates: '01-mining/candidates.md',
   gitHistoryDir: '01-mining/git-history',
+  materialText: '00-intake/material-text',
   sweep: '02-prior-art/sweep.md',
   decision: '03-decision/decision.md',
+  secondOpinion: '03-decision/second-opinion.md',
   claims: '04-claims/claims.md',
   spec: '05-spec/specification.md',
   abstract: '05-spec/abstract.md',
@@ -84,13 +86,15 @@ Write ${LAYOUT.sweep}: a plain-English summary first, then CLEAN GROUND, KILL ZO
     n: 3,
     title: 'Is it worth filing?',
     plain:
-      'Assesses the search results and how easily competitors could work around a patent. Recommends whether to continue, stop or resolve missing information.',
-    time: 'About 5 to 15 minutes',
+      'Assesses whether filing is worth the money. If the first AI recommends continuing, the other AI searches independently and checks that recommendation. If they disagree, you decide what happens next.',
+    time: 'About 20 to 45 minutes when a second opinion is needed',
     role: 'draft',
     skillPhase: 'Phase 2 decision gate and the worth-it screen at post-sweep width',
     outputs: [LAYOUT.decision],
+    optionalOutputs: [LAYOUT.secondOpinion],
     after: 'sweep',
     sealed: true,
+    usesIntake: true,
     task: `Apply the skill's Phase 2 decision gate and the worth-it screen at post-sweep width, using ${LAYOUT.sweep}.
 Write ${LAYOUT.decision}. Its FIRST line must be exactly one of:
 DECISION: GO
@@ -195,17 +199,36 @@ export function phaseById(id) {
   return PHASES.find((p) => p.id === id);
 }
 
+// Runs inside step 3, not as another step in the campaign.
+export const SECOND_OPINION = {
+  id: 'decision',
+  plain: 'The other AI searches independently and checks whether filing is worth the money before drafting starts.',
+  skillPhase: 'Phase 2 decision gate and worth-it screen: independent second opinion',
+  outputs: [LAYOUT.secondOpinion],
+  questionsInReport: true,
+  task: `Give an independent second opinion on the GO candidate(s) in ${LAYOUT.decision} before the inventor spends money on drafting.
+Do not trust the first AI's search or recommendation. Run your own targeted searches with the patent tools, aimed at what would kill each candidate: anticipation, obvious combinations and existing products. Check patent search access yourself; never agree if you could not complete the searches.
+Apply the skill's worth-it screen yourself, including design-around cost, detectability and the inventor's commercial evidence in ${LAYOUT.answers} and ${LAYOUT.intake}. Missing evidence is not evidence in favour of filing.
+Write ONLY ${LAYOUT.secondOpinion}. Do not edit, create or delete any other file, including questions or the first decision. Its FIRST line must be exactly one of:
+SECOND OPINION: AGREE
+SECOND OPINION: DISAGREE
+Then explain your reasons in plain English. List every new reference with its publication number (or product/source name), link and date; distinguish publication dates from search dates and say when a date is unknown. For DISAGREE, explain what evidence would change your mind and include any questions for the inventor in this report.
+Use DISAGREE when you cannot support going ahead, including unresolved commercial evidence or incomplete searches. Once the report is complete, end your message with STATUS: done. The app asks the inventor what to do about a disagreement.`,
+};
+
 export const statusProtocol = (phase) => `
 ## How this desktop app runs you (Patent Creator Studio)
 
 - You are running ONE phase of the campaign, headless, inside this invention's folder. Your working directory is the folder; write only inside it.
 - The inventor is a person, not you. Never list an AI as an inventor.
 - Earlier answers from the inventor, if any, are in ${LAYOUT.answers}. Read it before asking anything again.
-- If you need a decision or a fact only the inventor has, write the questions in plain English to ${questionsFile(phase.id)} (numbered, each answerable in a sentence), then stop with STATUS: needs-input.
+- The app makes a text copy of every PDF and Word file in the inventor's material, in ${LAYOUT.materialText}/ (index.md lists which copy is which; pages with no text, such as scans, are saved there as images). Read those copies instead of the original PDF or Word files.
+- You are the researcher. Find the answers; do not ask for them. Look everything up yourself: the material folders, the inventor's public footprint, the web, the patent tools. What you find is the answer: use it and cite where it came from, and never ask the inventor to confirm evidence you already have. Where nothing you can reach settles a fact, write your best-evidenced reading as a finding, with what would settle it (for example "the USPTO filing receipt"), and carry on. Choices a later step makes (which idea to pursue, how to claim it) are that step's job, not a question.
+- ${phase.questionsInReport ? `Put any questions for the inventor in ${phase.outputs[0]}. Do not write a separate questions file.` : `Stop for the inventor only when the NEXT step cannot run without something nobody else has: a decision that is theirs alone, or a fact about the invention itself that only the inventor knows (how their device actually works, what they built or tested) and that no material, record or search supplies. Never stop for a fact you could research (dates, filings, public history, prior art). When the draft has a gap only the inventor's own knowledge can fill, ask; never stop the campaign with STATUS: no-go over a gap the inventor has not yet been asked about. Write just those questions in plain English to ${questionsFile(phase.id)} (numbered, each answerable in a sentence) and stop with STATUS: needs-input. Urgent deadlines go at the top of your summary, not into a question.`}
 - Keep every file you write readable by someone who is not a lawyer or a programmer: lead with a short plain-English summary.
 - The app runs its own deterministic checks and decides readiness. Never write that anything is "filing-ready", "patentable", "verified" (without a content hash) or "good to go".
 - These campaign instructions are complete. Do not load unrelated personal skills or instructions you may find on this computer.
-- If anything only the inventor can answer blocks the NEXT step, use STATUS: needs-input, not done.
+- ${phase.questionsInReport ? 'A completed second opinion that needs inventor evidence must say SECOND OPINION: DISAGREE and end the message with STATUS: done; the app handles the questions.' : 'A fact you could research never justifies STATUS: needs-input; a blocking decision, or a blocking fact about the invention that only the inventor knows, does.'}
 - The very last line of your final message must be exactly one of:
   STATUS: done
   STATUS: needs-input

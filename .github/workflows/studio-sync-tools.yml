@@ -1,0 +1,78 @@
+name: Sync the patent tools
+
+# Studio carries its own copy of Claude-Patent-Creator. Every Monday (or on
+# demand) this checks the public repository for commits Studio does not have
+# yet and opens one pull request that merges them, so public fixes reach
+# Studio without anyone having to remember. A merge that conflicts opens an
+# issue instead, naming the files. Releases refuse to build while anything
+# public is missing (studio-release.yml).
+on:
+  schedule:
+    - cron: '0 14 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: studio-sync-tools
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'RobThePCGuy/Patent-Creator-Studio'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BRANCH: sync/claude-patent-creator
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Merge public main into a sync branch
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch -q https://github.com/RobThePCGuy/Claude-Patent-Creator.git main
+          PUBLIC=$(git rev-parse FETCH_HEAD)
+          if git merge-base --is-ancestor "$PUBLIC" HEAD; then
+            echo "Studio already has every public commit."
+            exit 0
+          fi
+          COUNT=$(git rev-list --count "HEAD..$PUBLIC")
+          VERSION=$(git show "$PUBLIC:pyproject.toml" | sed -n 's/^version *= *"\([^"]*\)".*/\1/p' | head -1)
+          # An open sync branch keeps whatever was added to it during review;
+          # new public commits are merged on top, never force-pushed over it.
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null; then
+            git fetch -q origin "$BRANCH"
+            git checkout -q -B "$BRANCH" "origin/$BRANCH"
+          else
+            git checkout -q -B "$BRANCH"
+          fi
+          if git merge-base --is-ancestor "$PUBLIC" HEAD; then
+            echo "The sync branch already has every public commit."
+          else
+            if ! git merge --no-edit -m "Merge Claude-Patent-Creator $VERSION ($COUNT new commits)" "$PUBLIC"; then
+              FILES=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+              git merge --abort
+              TITLE="Sync the patent tools: merge needs a hand"
+              BODY=$(printf 'Merging %s new commits from Claude-Patent-Creator main (%s) conflicts in:\n\n%s\n\nMerge public main by hand. Releases stay blocked until it is in.' "$COUNT" "$VERSION" "$FILES")
+              if [ -z "$(gh issue list --state open --search "in:title \"$TITLE\"" --json number -q '.[].number')" ]; then
+                gh issue create --title "$TITLE" --body "$BODY"
+              fi
+              exit 1
+            fi
+            git push -q origin "$BRANCH"
+          fi
+          # Also reached on a rerun after a failed PR creation: the branch is
+          # pushed but no PR exists yet.
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number -q '.[].number')" ]; then
+            gh pr create --base main --head "$BRANCH" \
+              --title "Merge Claude-Patent-Creator $VERSION" \
+              --body "$COUNT new commits from the public patent tools. Merge this before the next Studio release; releases refuse to build without it."
+          fi

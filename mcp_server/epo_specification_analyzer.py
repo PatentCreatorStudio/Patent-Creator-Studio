@@ -17,9 +17,9 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 try:
-    from analyzer_base import BaseAnalyzer, BaseIssue
+    from analyzer_base import BaseAnalyzer, BaseIssue, unsupported_through_chain
 except ImportError:
-    from mcp_server.analyzer_base import BaseAnalyzer, BaseIssue
+    from mcp_server.analyzer_base import BaseAnalyzer, BaseIssue, unsupported_through_chain
 
 
 @dataclass
@@ -499,13 +499,16 @@ class EPOSpecificationAnalyzer(BaseAnalyzer):
             if isinstance(i, EPOSpecSupportIssue) and i.severity == "CRITICAL" and i.issue_type == "sufficiency"
         }
         claims_with_critical &= claim_numbers
-        supported_claims = len(claim_numbers) - len(claims_with_critical)
+        # A dependent claim contains every limitation of its parent, so it is
+        # insufficiently disclosed whenever any claim up any of its dependency branches is.
+        unsupported = unsupported_through_chain(claims, claims_with_critical) & claim_numbers
+        supported_claims = len(claim_numbers) - len(unsupported)
 
         return {
             "percentage": int((supported_claims / len(claim_numbers)) * 100),
             "supported_claims": supported_claims,
             "total_claims": len(claim_numbers),
-            "unsupported_claims": list(claims_with_critical),
+            "unsupported_claims": sorted(unsupported),
         }
 
     def _generate_spec_summary(self, critical: int, important: int, warnings: list[dict]) -> str:

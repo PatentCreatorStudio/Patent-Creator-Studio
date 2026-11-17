@@ -39,7 +39,11 @@ if _pkg_dir not in sys.path:
 try:
     from dotenv import load_dotenv
 
-    load_dotenv(Path(__file__).parent.parent / ".env", override=False)
+    # Same files, same order as server.py: the project root .env, then the
+    # legacy mcp_server/.env. Otherwise setup and the server could disagree on
+    # settings such as PATENT_DATA_DIR.
+    for _env_path in (Path(__file__).parent.parent / ".env", Path(__file__).parent / ".env"):
+        load_dotenv(_env_path, override=False)
 except ImportError:
     pass
 try:
@@ -1537,6 +1541,19 @@ def config_command(args):
     return config_list_command(args)
 
 
+def _own_version(this_file: str) -> str:
+    """The version of the package copy this file belongs to, loaded from the
+    _version.py beside it by path, so another installed copy never answers."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_patent_creator_version", Path(this_file).resolve().with_name("_version.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.load_version(this_file)
+
+
 def main():
     """
     Main CLI entry point
@@ -1560,6 +1577,8 @@ Examples:
 For more information: https://github.com/RobThePCGuy/Claude-Patent-Creator
         """),
     )
+
+    parser.add_argument("--version", action="version", version=f"patent-creator {_own_version(__file__)}")
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
 

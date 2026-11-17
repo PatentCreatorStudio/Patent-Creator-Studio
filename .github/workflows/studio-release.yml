@@ -20,8 +20,36 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  tools-current:
+    # Studio carries its own copy of the patent tools and installs that copy
+    # on testers' computers. A release built while that copy is behind the
+    # public Claude-Patent-Creator would hand testers old checks, so the build
+    # waits until every public commit is merged in (the weekly sync workflow
+    # opens that merge as a pull request).
+    name: Patent tools include every public fix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+          fetch-depth: 0
+      - name: Compare with the public repository
+        run: |
+          git fetch -q https://github.com/RobThePCGuy/Claude-Patent-Creator.git main
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "Every public commit is in this release."
+            exit 0
+          fi
+          echo "::error::This release is missing $(git rev-list --count HEAD..FETCH_HEAD) commit(s) from Claude-Patent-Creator main. Merge them (or the sync pull request) first, then tag again."
+          git log --oneline HEAD..FETCH_HEAD | head -20
+          exit 1
+
   build:
     name: Build (${{ matrix.os }})
+    needs: tools-current
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:

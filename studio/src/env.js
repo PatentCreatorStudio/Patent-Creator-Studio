@@ -2,7 +2,7 @@
 // Python install, and Graphviz. A GUI-launched app on macOS gets a bare PATH, so
 // the login shell's PATH is read once and merged with the usual install spots.
 import { execFile, execFileSync, spawn } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -62,7 +62,7 @@ function run(cmd0, args0, opts = {}) {
     } catch (e) {
       return resolve({ ok: false, code: -1, stdout: '', stderr: '', error: e.message });
     }
-    execFile(cmd, args, { timeout: opts.timeout ?? 20000, env: opts.env ?? childEnv(), maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+    execFile(cmd, args, { cwd: opts.cwd, timeout: opts.timeout ?? 20000, env: opts.env ?? childEnv(), maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
       resolve({ ok: !err, code: err?.code ?? 0, stdout: String(stdout || ''), stderr: String(stderr || ''), error: err?.message });
     });
   });
@@ -115,6 +115,155 @@ export async function findPatentCreator(overridePath) {
   return which('patent-creator');
 }
 
+// ---- Which version of the patent tools is installed ----------------------
+// The app ships its own copy of the patent tools and installs that copy, so
+// the version it needs is the version of the copy it carries. An installed
+// copy older than that is out of date, and the app offers to update it.
+
+// [project].version from a pyproject.toml.
+export function pyprojectVersion(file) {
+  let text;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+  const section = text.match(/^\[project\][^\n]*\n([\s\S]*?)(?=^\s*\[|(?![\s\S]))/m);
+  const m = section && section[1].match(/^\s*version\s*=\s*["']([^"']+)["']/m);
+  return m ? m[1] : null;
+}
+
+// The lowest Python a pyproject.toml accepts (requires-python = ">=3.10").
+export function pyprojectMinPython(file) {
+  try {
+    const m = readFileSync(file, 'utf8').match(/^requires-python\s*=\s*["']\s*>=\s*(\d+\.\d+)/m);
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// "3.12" for a Python interpreter, or null if it does not answer.
+export async function pythonVersion(py) {
+  const r = await run(py, ['-I', '-c', 'import sys; print("%d.%d" % sys.version_info[:2])'], { cwd: HOME, timeout: 30000 });
+  const m = r.ok && r.stdout.trim().match(/^(\d+\.\d+)$/);
+  return m ? m[1] : null;
+}
+
+// Compares Python package versions: release numbers first, and a pre-release
+// (0.3.0rc1, 0.3.0b2, 0.3.0.dev1) before its final release. -1, 0 or 1.
+export function compareVersions(a, b) {
+  const parse = (v) => {
+    const m = String(v || '').trim().toLowerCase().match(/^v?(\d+(?:\.\d+)*)(?:[-_.]?(dev|a|alpha|b|beta|c|rc|pre|preview)[-_.]?(\d*))?/);
+    if (!m) return null;
+    const rank = { dev: 0, a: 1, alpha: 1, b: 2, beta: 2, c: 3, rc: 3, pre: 3, preview: 3 };
+    return { nums: m[1].split('.').map(Number), pre: m[2] ? [rank[m[2]], Number(m[3] || 0)] : [9, 0] };
+  };
+  const x = parse(a);
+  const y = parse(b);
+  if (!x || !y) return 0;
+  for (let i = 0; i < Math.max(x.nums.length, y.nums.length); i++) {
+    const d = (x.nums[i] || 0) - (y.nums[i] || 0);
+    if (d) return Math.sign(d);
+  }
+  return Math.sign(x.pre[0] - y.pre[0] || x.pre[1] - y.pre[1]);
+}
+
+// The Python that runs the installed patent tools: the interpreter the
+// patent-creator launcher itself names. A pip or uv launcher records it as a
+// "#!" line, at the top of the script on Mac and Linux and inside the .exe
+// on Windows. A Python merely sitting in the same folder is not proof (a
+// shared bin folder can hold a launcher from one install and a Python from
+// another), so only the recorded interpreter counts, and it must belong to a
+// virtual environment (pyvenv.cfg beside its folder) for the app to update it.
+export function toolsPython(pcPath) {
+  if (!pcPath) return null;
+  let file = pcPath;
+  try {
+    file = realpathSync(pcPath);
+  } catch {}
+  let text = '';
+  try {
+    if (statSync(file).size > 64 * 1024 * 1024) return null;
+    text = readFileSync(file).toString('utf8'); // pip and uv write the interpreter path as UTF-8
+  } catch {
+    return null;
+  }
+  // Two forms: "#!/path/to/python", and, when that path has spaces, pip's
+  // shell launcher: #!/bin/sh then '''exec' "/path with spaces/python" "$0" "$@".
+  const lines = [
+    ...text.matchAll(/#!\s*"?([^"\r\n]*?python[0-9.]*(?:w)?(?:\.exe)?)"?\s*(?:\r?\n|$)/gi),
+    ...text.matchAll(/exec'\s+"([^"\r\n]*?python[0-9.]*(?:w)?(?:\.exe)?)"/gi),
+  ];
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const py = lines[i][1].trim();
+    if (!py || /^\/usr\/bin\/env\b/.test(py) || !existsSync(py)) continue;
+    const venv = path.dirname(path.dirname(py));
+    if (existsSync(path.join(venv, 'pyvenv.cfg'))) return py;
+  }
+  return null;
+}
+
+// Asks the installed tools for their own version. Runs isolated (-I) from the
+// home folder, so a copy of the tools in the current folder cannot answer in
+// the installed copy's place. Old copies (before 0.3.0) report 0.2.0.
+const VERSION_PROBE = [
+  'import json, importlib.metadata as md',
+  'd = md.distribution("claude-patent-creator")',
+  'u = d.read_text("direct_url.json")',
+  'editable = bool(u and json.loads(u).get("dir_info", {}).get("editable"))',
+  'try:',
+  '    import mcp_server; v = mcp_server.__version__',
+  'except Exception:',
+  '    v = d.version',
+  'print(json.dumps({"version": v, "editable": editable}))',
+].join('\n');
+
+// Windows: programs running from inside a folder (another Studio window, or
+// Claude Code using the tools). Windows lets a running program be renamed but
+// not replaced, so the app asks Windows directly before updating. Returns
+// null when Windows cannot be asked.
+export async function processesRunningFrom(folder) {
+  if (!IS_WIN) return [];
+  const prefix = path.resolve(folder).replace(/'/g, "''") + '\\';
+  const ps = `Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith('${prefix}', [StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { "$($_.ProcessId) $($_.Name)" }`;
+  const r = await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { timeout: 30000 });
+  if (!r.ok) return null;
+  return r.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+}
+
+export async function pythonToolsVersion(py) {
+  const r = await run(py, ['-I', '-c', VERSION_PROBE], { cwd: HOME, timeout: 30000 });
+  try {
+    const j = JSON.parse(r.stdout.trim().split(/\r?\n/).pop());
+    if (j.version) return { version: String(j.version), editable: !!j.editable, python: py };
+  } catch {}
+  return null;
+}
+
+export async function installedToolsVersion(pcPath) {
+  const py = toolsPython(pcPath);
+  if (py) {
+    const r = await run(py, ['-I', '-c', VERSION_PROBE], { cwd: HOME, timeout: 30000 });
+    try {
+      const j = JSON.parse(r.stdout.trim().split(/\r?\n/).pop());
+      if (j.version) return { version: String(j.version), editable: !!j.editable, python: py };
+    } catch {}
+  }
+  // No virtual environment the app can see into: ask the command itself.
+  // Copies before 0.3.0 have no --version and answer with a usage error, so
+  // only a successful run that prints a real version number counts.
+  const r = await run(pcPath, ['--version'], { cwd: HOME, timeout: 30000 });
+  const m = r.ok && r.stdout.match(/^patent-creator\s+(\d[\w.+-]*)\s*$/m);
+  return { version: m ? m[1] : null, editable: false, python: py };
+}
+
+// Whether a given patent-creator install reports its rulebook search ready.
+export async function toolsStatusReady(pcPath) {
+  const r = await run(pcPath, ['status'], { timeout: 60000 });
+  return /Status:\s*Ready/i.test(r.stdout + r.stderr);
+}
+
 export async function detectAll(settings = {}) {
   await loginShellPath();
   const [claude, codex, pc, dot, python] = await Promise.all([
@@ -160,6 +309,24 @@ export async function detectAll(settings = {}) {
     );
   }
   if (pc) {
+    const needed = settings.bundledToolsVersion || null;
+    jobs.push(
+      installedToolsVersion(pc).then((v) => {
+        const t = out.patentCreator;
+        t.version = v.version;
+        t.editable = v.editable;
+        t.python = v.python;
+        t.neededVersion = needed;
+        // Older than the copy this app carries: the app's checks and the AI
+        // would run on old code. A developer's linked copy is never replaced.
+        t.outdated = !!(needed && (!v.version || compareVersions(v.version, needed) < 0));
+        // The app updates a copy in place only inside a virtual environment it
+        // can identify. Anything else gets the app's own copy installed in its
+        // usual folder instead (see setup:install).
+        t.canUpdate = t.outdated && !v.editable;
+        t.inPlace = !!v.python;
+      })
+    );
     jobs.push(
       run(pc, ['status'], { timeout: 60000 }).then((r) => {
         const text = r.stdout + r.stderr;
