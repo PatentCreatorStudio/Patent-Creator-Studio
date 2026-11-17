@@ -43,6 +43,19 @@ jobs:
             echo "Every public commit is in this release."
             exit 0
           fi
+          # The beta repository gets one clean commit per release, with no
+          # shared history, so there the check is on content: the tools the
+          # app installs and the instructions it runs must match public main.
+          TOOLS="mcp_server pyproject.toml skills agents commands hooks .claude-plugin scripts"
+          if ! git merge-base FETCH_HEAD HEAD >/dev/null 2>&1; then
+            if git diff --quiet FETCH_HEAD HEAD -- $TOOLS; then
+              echo "No shared history; the patent tools and instructions match public main exactly."
+              exit 0
+            fi
+            echo "::error::The patent tools in this release differ from Claude-Patent-Creator main. Merge public main into Studio and export again."
+            git diff --stat FETCH_HEAD HEAD -- $TOOLS | tail -20
+            exit 1
+          fi
           echo "::error::This release is missing $(git rev-list --count HEAD..FETCH_HEAD) commit(s) from Claude-Patent-Creator main. Merge them (or the sync pull request) first, then tag again."
           git log --oneline HEAD..FETCH_HEAD | head -20
           exit 1
