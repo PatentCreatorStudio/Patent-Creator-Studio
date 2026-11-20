@@ -31,6 +31,9 @@ const tar = path.join(os.tmpdir(), `pcs-beta-${process.pid}.tar`);
 git(repo, 'archive', '--format=tar', '-o', tar, 'HEAD');
 execFileSync('tar', ['-xf', tar, '-C', work]);
 fs.rmSync(tar);
+// Visitors to the beta repo come for the app, so its front page is the app's
+// own page. The patent tools' guide stays readable in the public repo.
+fs.copyFileSync(path.join(work, 'studio', 'LANDING.md'), path.join(work, 'README.md'));
 
 execFileSync('git', ['-C', work, 'add', '-A'], { env });
 execFileSync('git', ['-C', work, 'commit', '-q', '--allow-empty', '-m',

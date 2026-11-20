@@ -1,6 +1,6 @@
 {
   "name": "patent-creator-studio",
-  "version": "0.1.0",
+  "version": "0.1.0-beta.10",
   "description": "Desktop studio for Claude Patent Creator",
   "main": "src/main.js",
   "scripts": {

@@ -78,7 +78,8 @@ Write ${LAYOUT.candidates}: a plain-English summary first, then each candidate w
     sealed: true,
     needsSearch: true,
     task: `Run Phase 2 of the skill (Prior art) for every candidate marked pursue in ${LAYOUT.candidates}.
-First call check_google_patents_status and check_bigquery_status and record both results at the top of the report. Follow the skill's rule exactly if neither is ready.
+First call check_google_patents_status, check_epo_api_status, check_uspto_api_status and check_bigquery_status and record all four results at the top of the report. Google Patents, EPO and USPTO report ready; BigQuery reports available. The patent outlet is available when Google Patents, EPO or BigQuery is ready. USPTO alone provides US application metadata and does not satisfy that gate. Follow the skill's blocked rule if none of Google Patents, EPO or BigQuery is available.
+Use every ready source: search_patents_google for Google Patents; search_epo_patents for worldwide title/abstract searches using CQL ta= or ti= keywords and cpc= or ic= class codes; search_uspto_api for US application metadata; and search_patents_bigquery sparingly. Each BigQuery keyword search scans about 341 GiB, so its free monthly allowance covers only about three searches. Prioritize focused queries and record each source actually searched.
 Write ${LAYOUT.sweep}: a plain-English summary first, then CLEAN GROUND, KILL ZONES, MANDATORY CLAIM READS and UNRESOLVED LEADS, each item with its source, link and date, and the outlets searched with the date of the search. Follow the skill's language discipline.`,
   },
   {
@@ -100,7 +101,7 @@ Write ${LAYOUT.decision}. Its FIRST line must be exactly one of:
 DECISION: GO
 DECISION: NO-GO
 DECISION: BLOCKED
-Use BLOCKED when the patent outlet was not searched (no Google Patents or BigQuery access). For NO-GO, the file is the no-go report the skill describes, including the design-around and the defensive-publication alternative. For GO, name the candidate(s) going forward, the clean ground each independent claim must recite, the design-around cost and detectability, and the provisional-versus-defensive-publication recommendation.`,
+Use BLOCKED when the patent outlet was not searched (none of Google Patents, EPO or BigQuery was available). For NO-GO, the file is the no-go report the skill describes, including the design-around and the defensive-publication alternative. For GO, name the candidate(s) going forward, the clean ground each independent claim must recite, the design-around cost and detectability, and the provisional-versus-defensive-publication recommendation.`,
   },
   {
     id: 'claims',
@@ -115,8 +116,8 @@ Use BLOCKED when the patent outlet was not searched (no Google Patents or BigQue
     outputs: [LAYOUT.claims],
     after: 'decision',
     writes: 'draft',
-    task: `Run the claims part of Phase 3 of the skill for the GO candidate(s) in ${LAYOUT.decision}, using the clean ground in ${LAYOUT.sweep}.
-Write ${LAYOUT.claims} containing ONLY the numbered claims (no commentary). Put your drafting notes, the source verification of every limitation, and the worth-it re-check in 04-claims/claims-notes.md.`,
+    task: `Run the claims part of Phase 3 of the skill for the GO candidate(s) in ${LAYOUT.decision}, or the candidate(s) the inventor chose to pursue with File anyway, using the supported ground in ${LAYOUT.sweep}.
+Write ${LAYOUT.claims} containing ONLY the numbered claims (no commentary). Put your drafting notes, the source verification of every limitation, and the worth-it re-check (remaining risks only after File anyway) in 04-claims/claims-notes.md.`,
   },
   {
     id: 'spec',
@@ -151,7 +152,8 @@ Write ${LAYOUT.spec} (the full specification, no commentary), ${LAYOUT.abstract}
     writes: 'draft',
     checksDraft: true,
     task: `If ${LAYOUT.examiner} or ${LAYOUT.packageReview} exist from an earlier attack, first address every MUST-FIX finding in them (narrow claims or move elements to dependents as the skill says; never invent disclosure) and note each resolution in ${LAYOUT.verification}. Do not edit or delete the attack reports themselves.
-An attack that lands is a real finding about the invention, not a failure of this process. Answer it only with narrowing the specification already supports. Then run the skill's worth-it screen again at the narrowed width: could a competitor design around what is left cheaply, and could infringement even be detected? If narrowing cannot answer a landed attack, or what is left is not worth the filing money, do NOT keep drafting. Write ${LAYOUT.noGo} for the inventor in plain English: what the attack found and the references behind it, the narrowest claim the description could still support and what it would and would not cover, why that is not worth filing, and the alternatives (defensive publication so nobody else can patent it, or keeping it as a trade secret), then end with STATUS: no-go.
+An attack that lands is a real finding about the invention, not a failure of this process. Answer it only with supported narrowing; any added specification features must already be described in the inventor's material. If the inventor chose File anyway, fix as far as that material allows and record unresolved attacks and risks honestly. Do not reopen the worth-it decision or stop because of obviousness risk, easy workarounds, hard-to-detect infringement or cost. Stop with STATUS: no-go only if the draft cannot honestly be finished from the material even after supported fixes and asking about blocking invention facts only the inventor knows; explain that gap and attempted fixes in ${LAYOUT.noGo}.
+Otherwise, run the skill's worth-it screen again at the narrowed width: could a competitor design around what is left cheaply, and could infringement even be detected? If narrowing cannot answer a landed attack, or what is left is not worth the filing money, do NOT keep drafting. Write ${LAYOUT.noGo} for the inventor in plain English: what the attack found and the references behind it, the narrowest claim the description could still support and what it would and would not cover, why that is not worth filing, and the alternatives (defensive publication so nobody else can patent it, or keeping it as a trade secret), then end with STATUS: no-go.
 Then run Phase 4 of the skill. The app has ALREADY run review_patent_claims (with the antecedent check enabled), review_specification and check_formalities on the current files; their results are in ${LAYOUT.gates}. Read them.
 Fix every genuine finding in ${LAYOUT.claims}, ${LAYOUT.spec} and ${LAYOUT.abstract} without inventing disclosure. Manually verify each LOW-confidence flag and record a verdict for each in ${LAYOUT.verification}, along with what you changed. You may re-run the tools yourself while fixing, but the app re-runs them after you finish and only its results count.`,
   },
@@ -179,7 +181,7 @@ Do NOT change ${LAYOUT.claims}, ${LAYOUT.spec}, ${LAYOUT.abstract} or anything i
     n: 8,
     title: 'Review with a second AI',
     plain:
-      'The other AI challenges the claims and checks the assembled files for problems. If fixes are needed, step 6 narrows the claims or says plainly that what is left is not worth filing, then steps 7 and 8 repeat.',
+      'The other AI challenges the claims and checks the assembled files for problems. If fixes are needed, step 6 addresses them, then steps 7 and 8 repeat. After File anyway, a later stop means the AI could not finish the draft from your material.',
     time: 'About 15 to 30 minutes',
     role: 'review',
     requiresGo: true,

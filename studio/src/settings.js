@@ -6,7 +6,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-const KEY_NAMES = ['anthropic', 'openai', 'serpapi'];
+const KEY_NAMES = ['anthropic', 'openai', 'serpapi', 'epoKey', 'epoSecret', 'uspto'];
 
 function dir() {
   const d = app.getPath('userData');
@@ -24,6 +24,7 @@ const DEFAULTS = {
   codexModel: '',
   codexEffort: 'high',
   patentCreatorPath: '',
+  googleCloudProject: '',
 };
 
 export function loadSettings() {
@@ -55,6 +56,9 @@ export function keyStatus() {
     anthropic: !!k.anthropic,
     openai: !!k.openai,
     serpapi: !!k.serpapi,
+    epoKey: !!k.epoKey,
+    epoSecret: !!k.epoSecret,
+    uspto: !!k.uspto,
   };
 }
 

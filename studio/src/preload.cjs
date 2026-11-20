@@ -8,6 +8,7 @@ const call = (ch, ...args) =>
 
 contextBridge.exposeInMainWorld('studio', {
   env: (force) => call('env:get', force),
+  checkUpdates: (force) => call('updates:check', force),
   settings: () => call('settings:get'),
   saveSettings: (patch) => call('settings:set', patch),
   setKey: (name, value) => call('settings:setKey', name, value),
@@ -33,6 +34,7 @@ contextBridge.exposeInMainWorld('studio', {
   install: () => call('setup:install'),
   installTool: (name) => call('setup:installTool', name),
   login: (name) => call('setup:login', name),
+  cancelLogin: (name) => call('setup:cancelLogin', name),
   loginCode: (name, code) => call('setup:loginCode', name, code),
   openExternal: (url) => call('shell:openExternal', url),
   pickMaterial: () => call('dialog:pickMaterial'),

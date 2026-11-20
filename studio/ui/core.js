@@ -83,15 +83,22 @@ export function engineFamily(engine) {
 }
 export const familyName = (fam) => (fam === 'claude' ? 'Claude' : 'Codex');
 
-export function engineAvailable(id) {
-  const e = state.env;
-  const k = state.settings.keys;
+export function engineAvailable(id, e = state.env, k = state.settings?.keys || {}) {
   if (!e) return true;
   if (id === 'claude-sub') return e.claude.installed && e.claude.loggedIn;
   if (id === 'claude-key') return e.claude.installed && k.anthropic;
   if (id === 'codex-sub') return e.codex.installed && e.codex.loggedIn;
   if (id === 'codex-key') return e.codex.installed && k.openai;
   return false;
+}
+
+export function aiAvailable(name, e = state.env, k = state.settings?.keys || {}) {
+  return !!e && (engineAvailable(`${name}-sub`, e, k) || engineAvailable(`${name}-key`, e, k));
+}
+
+export function updateNotice() {
+  const update = state.update;
+  return update?.newer ? `Version ${esc(update.version)} is available. <a href="${esc(update.url)}">Download it</a>` : '';
 }
 
 // Web links open in the person's browser; nothing else navigates.

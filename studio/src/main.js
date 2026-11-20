@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain, shell, dialog, Menu, clipboard } from 'electron';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readFileSync, existsSync, appendFileSync, mkdirSync, lstatSync, renameSync } from 'node:fs';
 import { detectAll, streamCommand, loginShellPath, childEnv, pyprojectVersion, compareVersions, processesRunningFrom, pythonToolsVersion, pythonVersion, pyprojectMinPython, toolsStatusReady, toolsPython } from './env.js';
@@ -26,6 +27,39 @@ const INDEX_URL = pathToFileURL(INDEX_HTML).href;
 
 let win;
 let envCache = null;
+let updateCache = null;
+let updateCheck = null;
+let updateCheckedAt = 0;
+const loginRequests = new Map();
+
+async function checkUpdates(force = false) {
+  if (updateCheck) return updateCheck;
+  if (!force && updateCache && Date.now() - updateCheckedAt < 60 * 60 * 1000) return updateCache;
+  updateCheck = (async () => {
+    try {
+      const response = await fetch('https://api.github.com/repos/PatentCreatorStudio/Patent-Creator-Studio-Beta/releases?per_page=10', {
+        headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Patent-Creator-Studio' },
+        signal: AbortSignal.timeout(5000),
+      });
+      if (!response.ok) throw new Error('Could not check releases.');
+      const releases = await response.json();
+      const newest = releases.filter((r) => !r.draft && /^v?\d+\.\d+\.\d+(?:-beta\.\d+)?$/.test(r.tag_name))
+        .sort((a, b) => compareVersions(b.tag_name, a.tag_name))[0];
+      const newer = !!newest && compareVersions(newest.tag_name, app.getVersion()) > 0;
+      updateCache = { newer, ...(newer ? { version: newest.tag_name.replace(/^v/, ''), url: newest.html_url } : {}) };
+    } catch {
+      updateCache = { ...updateCache, error: 'Could not check for a newer version.' };
+    } finally {
+      updateCheckedAt = Date.now();
+    }
+    return updateCache;
+  })();
+  try {
+    return await updateCheck;
+  } finally {
+    updateCheck = null;
+  }
+}
 
 function send(channel, payload) {
   if (win && !win.isDestroyed()) win.webContents.send(channel, payload);
@@ -59,8 +93,12 @@ function pcPath() {
 // of the one process that runs them, never a file or a command line.
 function searchEnv() {
   const out = {};
-  const serp = getKey('serpapi');
-  if (serp) out.SERPAPI_API_KEY = serp;
+  for (const [name, envName] of Object.entries({ serpapi: 'SERPAPI_API_KEY', epoKey: 'EPO_OPS_KEY', epoSecret: 'EPO_OPS_SECRET', uspto: 'USPTO_API_KEY' })) {
+    const value = getKey(name);
+    if (value) out[envName] = value;
+  }
+  const project = loadSettings().googleCloudProject;
+  if (project) out.GOOGLE_CLOUD_PROJECT = project;
   return out;
 }
 
@@ -251,7 +289,10 @@ async function fixRound(projectId, fr) {
         changed();
         const st = await runAndWait(projectId, phaseId);
         if (fr.cancelled) outcome = 'Fix round stopped.';
-        else if (st !== 'done' && st !== 'done-unconfirmed') outcome = st === 'needs-input' ? 'Fix round paused: a step needs your answers.' : st === 'no-go' ? 'Fix round finished: the app recommends not filing.' : 'Fix round stopped: a step did not finish. Read its summary.';
+        else if (st === 'no-go') outcome = campaign.overruled(projects.loadProject(projectId).stamps?.decision)
+          ? "Fix round stopped: the AI reports it can't finish the draft from your material. Read its summary."
+          : 'Fix round finished: the app recommends not filing.';
+        else if (st !== 'done' && st !== 'done-unconfirmed') outcome = st === 'needs-input' ? 'Fix round paused: a step needs your answers.' : 'Fix round stopped: a step did not finish. Read its summary.';
         if (outcome) break;
       }
       if (outcome) break;
@@ -285,16 +326,21 @@ async function runPhase(projectId, phaseId, { engine: engineOverride, reply, fre
   const prev = p.phases?.[phaseId];
   // A reply to a second opinion belongs to the AI that made the first
   // recommendation, even if the screen's engine selection has changed.
-  const decisionReview = phaseId === 'decision' && reply ? prev?.decisionReview : null;
-  if (decisionReview && (decisionReview.afterAt !== p.stamps?.sweep?.at || JSON.stringify(decisionReview.basis) !== JSON.stringify(campaign.basisNow(p)) || decisionReview.decisionHash !== projects.fileHash(p, LAYOUT.decision) || (decisionReview.hash && decisionReview.hash !== projects.fileHash(p, LAYOUT.secondOpinion)))) {
+  let decisionReview = phaseId === 'decision' && reply ? prev?.decisionReview : null;
+  const firstEngine = decisionReview?.firstEngine;
+  const retryRequested = decisionReview?.verdict === 'unavailable' && /^(?:ready|retry|try again|it['’]s ready)[.!]?$/i.test(reply.trim());
+  const reviewCurrent = decisionReviewCurrent(p, decisionReview);
+  const retrySecondOpinion = retryRequested && reviewCurrent && parseDecision(projects.readFile(p, LAYOUT.decision)) === 'GO' && !projects.linksIn(p, ['03-decision']).length;
+  if (decisionReview && !reviewCurrent && !retryRequested) {
     throw new Error('The facts or decision reports changed while step 3 was waiting. Select Run again for a new recommendation and second opinion.');
   }
-  const engine = decisionReview?.firstEngine || engineOverride || defaultEngine(p, phase, settings);
+  if (retryRequested && !retrySecondOpinion) decisionReview = null;
+  const engine = firstEngine || engineOverride || defaultEngine(p, phase, settings);
   const def = ENGINES[engine];
   if (!def) throw new Error('This AI choice is unavailable. Choose an AI in Settings.');
   const cliPath = e[def.cli]?.path;
   const name = (fam) => (fam === 'claude' ? 'Claude' : 'Codex');
-  if (!cliPath) throw new Error(`${def.cli === 'claude' ? 'Claude Code' : 'Codex'} is missing. Install it in Setup.`);
+  if (!cliPath && !retrySecondOpinion) throw new Error(`${def.cli === 'claude' ? 'Claude Code' : 'Codex'} is missing. Install it in Setup.`);
   // One AI writes the whole draft; the other attacks it. The first run of
   // step 4 picks the writer for good: once an AI has written any of a draft,
   // the app can no longer show that every word of it was replaced, so that AI
@@ -336,20 +382,33 @@ async function runPhase(projectId, phaseId, { engine: engineOverride, reply, fre
   });
   send('project:changed', view(p));
 
-  execute({ op, projectId, phase, engine, cliPath, key, pc, settings, reply, fresh, prev, run, logFile }).catch((err) => {
+  execute({ op, projectId, phase, engine, cliPath, key, pc, settings, reply, fresh, prev, run, logFile, retrySecondOpinion }).catch((err) => {
     send('run:event', { projectId, phaseId, ev: { kind: 'error', text: `The app could not finish: ${err.message}. Restart the app before trying again.` } });
   });
   return { started: true, engine };
 }
 
-function otherEngine(fam) {
-  return fam === 'claude' ? (getKey('openai') && !envCache?.codex?.loggedIn ? 'codex-key' : 'codex-sub') : getKey('anthropic') && !envCache?.claude?.loggedIn ? 'claude-key' : 'claude-sub';
+function decisionReviewCurrent(p, review) {
+  return !!review && review.afterAt === p.stamps?.sweep?.at
+    && JSON.stringify(review.basis) === JSON.stringify(campaign.basisNow(p))
+    && review.decisionHash === projects.fileHash(p, LAYOUT.decision)
+    && (!review.hash || review.hash === projects.fileHash(p, LAYOUT.secondOpinion));
+}
+
+function otherEngine(fam, preferred) {
+  const other = fam === 'claude' ? 'codex' : 'claude';
+  const usable = (engine) => {
+    const def = ENGINES[engine];
+    return def && envCache?.[def.cli]?.installed && (def.key ? !!getKey(def.key) : envCache?.[def.cli]?.loggedIn);
+  };
+  if (family(preferred) === other && usable(preferred)) return preferred;
+  return usable(`${other}-sub`) ? `${other}-sub` : usable(`${other}-key`) ? `${other}-key` : `${other}-sub`;
 }
 
 function defaultEngine(p, phase, settings) {
-  const other = otherEngine;
-  const same = (fam) => other(fam === 'claude' ? 'codex' : 'claude');
-  if (phase.role === 'review') return p.writer && family(settings.reviewEngine) === p.writer ? other(p.writer) : settings.reviewEngine;
+  const other = (fam) => otherEngine(fam, settings.reviewEngine);
+  const same = (fam) => otherEngine(fam === 'claude' ? 'codex' : 'claude');
+  if (phase.role === 'review') return other(p.writer || (family(settings.reviewEngine) === 'claude' ? 'codex' : 'claude'));
   if (phase.writes === 'draft' && phase.id !== 'claims' && p.writer && family(settings.draftEngine) !== p.writer) return same(p.writer);
   return settings.draftEngine;
 }
@@ -368,10 +427,10 @@ async function secondOpinion({ op, projectId, p, engine: firstEngine, pc, settin
   setStage(projectId, op, 'second-opinion');
   const available = await env(true);
   if (op.cancelled) throw new Error('Step stopped. Select Run again to restart.');
-  const engine = otherEngine(family(firstEngine));
+  const engine = otherEngine(family(firstEngine), settings.reviewEngine);
   const def = ENGINES[engine];
   const key = def.key ? getKey(def.key) : null;
-  const context = { firstEngine, secondEngine: engine, basis: op.basis, afterAt: op.afterAt };
+  const context = { firstEngine, secondEngine: engine, basis: op.basis, afterAt: op.afterAt, continuedByInventor: op.decisionReview?.continuedByInventor === true };
   if (!available[def.cli]?.path || (def.key ? !key : !available[def.cli]?.loggedIn)) return { ...context, verdict: 'unavailable' };
 
   removeInside(p.folder, LAYOUT.secondOpinion);
@@ -381,6 +440,7 @@ async function secondOpinion({ op, projectId, p, engine: firstEngine, pc, settin
   const before = protectedFiles();
   let finalEv = null;
   let result;
+  let failed = null;
   say('gate', `${def.cli === 'claude' ? 'Claude' : 'Codex'} is searching independently and checking whether filing is worth the money.`);
   try {
     const handle = runEngine({ engine, cliPath: available[def.cli].path, pcPath: pc, repoRoot: REPO_ROOT, appDataDir: app.getPath('userData'), cwd: p.folder, systemText: `${skillText()}\n\n${statusProtocol(SECOND_OPINION)}\n\n${folderRule(p.folder)}\n\nThis run is: ${SECOND_OPINION.skillPhase}.`, prompt: SECOND_OPINION.task, resumeId: null, settings, key, serverEnv: searchEnv(), readDirs: (p.intake?.materials || []).filter((m) => m && existsSync(m)) }, (ev) => {
@@ -390,28 +450,35 @@ async function secondOpinion({ op, projectId, p, engine: firstEngine, pc, settin
     });
     op.stop = handle.stop;
     result = await handle.done;
+  } catch (err) {
+    say('error', err.message || 'The second AI stopped with an error.');
+    failed = 'the review could not finish; read the run details';
   } finally {
     op.stop = null;
     if (protectedFiles() !== before) throw new Error('The second AI changed files outside its second-opinion report. Review the changed files and run step 3 again.');
   }
-  if (op.cancelled || result.signal) throw new Error('Step stopped during the second opinion. Select Run again to restart.');
-  if (result.code !== 0 || !finalEv || finalEv.ok === false) throw new Error('The second AI did not finish. Read the run details, check its connection and sign-in in Setup, then run step 3 again.');
-  if (parseStatus(finalEv.text).status !== 'done') throw new Error('The second AI did not confirm a completed opinion. Read the run details and run step 3 again.');
+  if (op.cancelled) throw new Error('Step stopped during the second opinion. Select Run again to restart.');
+  if (!failed && (result.signal || result.code !== 0)) failed = 'the review stopped with an error; read the run details';
+  if (!failed && (!finalEv || finalEv.ok === false)) failed = 'the AI returned no completed result';
+  if (!failed && parseStatus(finalEv.text).status !== 'done') failed = 'the AI did not confirm that its opinion was complete';
+  if (failed) return { ...context, verdict: 'unavailable', failed };
   const firstLine = (projects.readFile(p, LAYOUT.secondOpinion) || '').split(/\r?\n/)[0];
   const verdict = firstLine === 'SECOND OPINION: AGREE' ? 'AGREE' : firstLine === 'SECOND OPINION: DISAGREE' ? 'DISAGREE' : null;
-  if (!verdict || projects.linksIn(p, ['03-decision']).length) throw new Error('The second AI did not save a valid second-opinion report. Run step 3 again.');
+  if (!verdict || projects.linksIn(p, ['03-decision']).length) return { ...context, verdict: 'unavailable', failed: 'the AI did not save a valid second-opinion report' };
   return { ...context, verdict, hash: projects.fileHash(p, LAYOUT.secondOpinion), sessionId: result.sessionId, costUsd: finalEv.costUsd ?? null };
 }
 
 function secondOpinionQuestion(p, review) {
   const question = review.verdict === 'DISAGREE'
     ? `The two AIs disagree about whether filing is worth the money. Read ${LAYOUT.decision} and ${LAYOUT.secondOpinion}.\n\nReply "continue" to draft anyway, "stop" to end with a not-worth-filing result, or answer the concerns and evidence requested in the second opinion. The first AI will weigh your reply and rewrite its recommendation.`
-    : `A second AI is needed to check the recommendation before drafting. ${family(review.secondEngine) === 'claude' ? 'Claude' : 'Codex'} is not installed or signed in and has no usable API-key setup. Open Setup to install or sign in, or add its API key in Settings, then reply that it is ready. You may instead reply "continue" to proceed on one AI's recommendation, or "stop" to end with a not-worth-filing result.`;
+    : review.failed
+      ? `The second AI started but did not finish (${review.failed}). Check Setup or its usage limit, then reply "ready" to try it again, "continue" to proceed on one AI's recommendation, or "stop" to end with a not-worth-filing result.`
+      : `A second AI is needed to check the recommendation before drafting. Open Setup to install or sign in to ${family(review.secondEngine) === 'claude' ? 'Claude' : 'Codex'}, or add its API key in Settings, then reply "ready" to try again. You may instead reply "continue" to proceed on one AI's recommendation, or "stop" to end with a not-worth-filing result.`;
   writeInside(p.folder, questionsFile('decision'), question + '\n');
   return question;
 }
 
-async function execute({ op, projectId, phase, engine, cliPath, key, pc, settings, reply, fresh, prev, run, logFile }) {
+async function execute({ op, projectId, phase, engine, cliPath, key, pc, settings, reply, fresh, prev, run, logFile, retrySecondOpinion = false }) {
   const phaseId = phase.id;
   const say = (kind, text) => {
     const ev = { kind, text };
@@ -423,12 +490,21 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
   const toolErrors = [];
   const refusedWrites = [];
   let drops = 0;
-  let res = { code: -1 };
+  let res = { code: retrySecondOpinion ? 0 : -1 };
   let searchReady = null;
   let resumeId = null;
   let appError = null;
 
   try {
+    const qFile = questionsFile(phaseId);
+    if (reply && !fresh) {
+      // Save the answer before any check can stop the step. Keep a review
+      // recovery question until its retry succeeds or replaces the question.
+      const qs = projects.readFile(p, qFile) || prev?.runs?.[prev.runs.length - 1]?.summary || '';
+      const entry = `\n## ${new Date().toISOString().slice(0, 16).replace('T', ' ')} (step: ${phase.title})\n\n### Questions\n\n${qs.trim()}\n\n### The inventor's answers\n\n${reply.trim()}\n`;
+      writeInside(p.folder, LAYOUT.answers, entry, { append: true });
+      if (!retrySecondOpinion) removeInside(p.folder, qFile);
+    }
     syncGateEnv();
     if (phase.gatesBefore) {
       say('gate', 'Running draft checks before the AI starts…');
@@ -439,90 +515,93 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
     if (phase.needsSearch) {
       const st = await gates.searchStatus(pc).catch((err) => ({ ready: false, error: err.message }));
       searchReady = !!st.ready;
-      say(st.ready ? 'gate' : 'warn', st.ready ? 'Patent search is on.' : 'Patent search is unavailable. Add a search key in Settings, then run step 2 again.');
+      if (op.cancelled) throw Object.assign(new Error('Step stopped. Select Run again to restart.'), { stopped: true });
+      if (!st.ready) throw new Error(`Patent search is off (${gates.searchReasons(st).join('; ')}). Add a Google Patents (SerpApi) key or free EPO keys in Settings, then run this step again.`);
+      say('gate', `Patent search is on: ${st.sources.join(', ')}.`);
     }
 
-    const qFile = questionsFile(phaseId);
-    if (reply && !fresh) {
-      // Every answer the inventor gives is kept on disk, so later steps (and a
-      // fresh run on a different AI) see it too. The answered questions are
-      // filed with the answers and their own file is cleared by the app.
-      const qs = projects.readFile(p, qFile) || prev?.runs?.[prev.runs.length - 1]?.summary || '';
-      const entry = `\n## ${new Date().toISOString().slice(0, 16).replace('T', ' ')} (step: ${phase.title})\n\n### Questions\n\n${qs.trim()}\n\n### The inventor's answers\n\n${reply.trim()}\n`;
-      writeInside(p.folder, LAYOUT.answers, entry, { append: true });
-      removeInside(p.folder, qFile);
-    }
-    resumeId = reply && !fresh && prev?.lastSession?.engine === engine ? prev.lastSession.sessionId : null;
-    const replyTask = decisionReplyTask(op.decisionReview, reply);
-    const prompt = (reply
-      ? resumeId
-        ? `The inventor answered your questions (also saved in ${LAYOUT.answers}):\n\n${reply}\n\nContinue the same phase. Remember the STATUS line at the end.`
-        : `${phase.task}\n\nThe inventor has answered your earlier questions; the answers are in ${LAYOUT.answers} (latest at the bottom). Use them.`
-      : phase.task) + replyTask;
-    // A draft made against a NO-GO is the inventor's decision; the AI drafts
-    // the strongest honest version and says so, without re-arguing it.
-    const against = phase.requiresGo && campaign.overruled(p.stamps?.decision)
-      ? `\n\nThe inventor chose to file against the NO-GO recommendation in ${LAYOUT.decision} (recorded in ${LAYOUT.answers}). That decision is theirs. Do not re-argue it or refuse the work. Build on the narrowest clean ground in ${LAYOUT.sweep} and ${LAYOUT.decision}, keep the claims honest about the prior art found, and where a report summarises the campaign, state plainly that it was drafted against the AI's recommendation. Later steps may still stop with STATUS: no-go if the draft itself fails.`
-      : '';
-    const systemText = `${skillText()}\n\n${statusProtocol(phase)}\n\n${folderRule(p.folder)}\n\nThis run is: ${phase.skillPhase}.${against}`;
+    if (!retrySecondOpinion) {
+      resumeId = reply && !fresh && (!prev?.decisionReview || op.decisionReview) && prev?.lastSession?.engine === engine ? prev.lastSession.sessionId : null;
+      const replyTask = decisionReplyTask(op.decisionReview, reply);
+      const prompt = (reply
+        ? resumeId
+          ? `The inventor answered your questions (also saved in ${LAYOUT.answers}):\n\n${reply}\n\nContinue the same phase. Remember the STATUS line at the end.`
+          : `${phase.task}\n\nThe inventor has answered your earlier questions; the answers are in ${LAYOUT.answers} (latest at the bottom). Use them.`
+        : phase.task) + replyTask;
+      // A draft made against a NO-GO is the inventor's decision; the AI drafts
+      // the strongest honest version and says so, without re-arguing it.
+      // The recommendation belongs to whichever AI ran step 3; a different AI
+      // reading it must not call it its own.
+      const decidedBy = ENGINES[p.stamps?.decision?.engine]?.cli;
+      const whose = (decidedBy
+        ? `The step 3 recommendation was made by ${decidedBy === 'codex' ? 'Codex' : 'Claude'}.`
+        : 'The AI that made the step 3 recommendation is not recorded; do not guess its identity.')
+        + ' Refer to it as "the step 3 recommendation", not "my recommendation".';
+      const against = phase.requiresGo && campaign.overruled(p.stamps?.decision)
+        ? `\n\nThe inventor chose to file against the NO-GO recommendation in ${LAYOUT.decision} (recorded in ${LAYOUT.answers}). ${whose} That decision is theirs. Do not re-argue it or refuse the work. Build on the narrowest supported ground in ${LAYOUT.sweep} and ${LAYOUT.decision}, keep the claims honest about the prior art found, and where a report summarises the campaign, state plainly that it was drafted against the step 3 recommendation. The inventor has already accepted the worth-it risks: obviousness exposure, competitors working around the claims, infringement that is hard to detect, and cost. Never stop with STATUS: no-go for any of those. This overrides the skill's worth-it stop rules for this run. In drafting and fix steps, address findings as far as the inventor's material allows (add features already described in that material to the specification, narrow claims to them; never invent disclosure) and state the risk that remains. Step 7 still must not edit the working draft; step 8 reports findings and proposed fixes only, preserving honest MUST-FIX and FAIL verdicts for attacks that still land. A later step may stop with STATUS: no-go only when the draft cannot honestly be finished from the inventor's material even after supported fixes, for example when no claim can be supported. Ask about a blocking invention fact only the inventor can supply before treating the gap as a no-go. Explain any such stop in the step's summary and, for step 6, in ${LAYOUT.noGo}; explain the material gap and attempted fixes, not why filing is poor value.`
+        : '';
+      const systemText = `${skillText()}\n\n${statusProtocol(phase)}\n\n${folderRule(p.folder)}\n\nThis run is: ${phase.skillPhase}.${against}`;
 
-    if (op.cancelled) throw Object.assign(new Error('Step stopped. Select Run again to restart.'), { stopped: true });
-    const materials = (p.intake?.materials || []).filter((m) => m && existsSync(m));
-    // History mining reads git history the app saves itself, so the AI needs
-    // no shell for it (Claude Code has none on Windows).
-    if (phaseId === 'mining') {
-      for (const line of await saveGitHistory(p.folder, materials, LAYOUT.gitHistoryDir)) say('gate', line);
-    }
-    // PDF and Word material gets text copies every AI can read (Claude Code
-    // needs Poppler for PDFs, which most Windows computers lack).
-    for (const line of await saveMaterialText(p.folder, materials, LAYOUT.materialText, toolsPython(pc))) say('gate', line);
-    // An internet drop is not the inventor's problem: the app keeps hold of
-    // the step, waits for the connection, and continues the same
-    // conversation (this attempt's own, never an older one).
-    const freshPrompt = (reply ? `${phase.task}\n\nThe inventor has answered your earlier questions; the answers are in ${LAYOUT.answers} (latest at the bottom). Use them.` : phase.task) + replyTask;
-    const host = family(engine) === 'claude' ? 'api.anthropic.com' : 'chatgpt.com';
-    let promptNow = prompt;
-    let resumeNow = resumeId;
-    for (;;) {
-      finalEv = null;
-      toolErrors.length = 0;
-      const handle = runEngine(
-        { engine, cliPath, pcPath: pc, repoRoot: REPO_ROOT, appDataDir: app.getPath('userData'), cwd: p.folder, systemText, prompt: promptNow, resumeId: resumeNow, settings, key, serverEnv: searchEnv(), readDirs: materials },
-        (ev) => {
-          if (ev.kind === 'final') finalEv = ev;
-          if (ev.kind === 'error') toolErrors.push(String(ev.text || '').slice(0, 2000));
-          if (ev.kind === 'toolResult' && ev.ok === false && /requested permissions to write/i.test(ev.text || '')) refusedWrites.push(String(ev.text).match(/write to (.+?), but/)?.[1] || '');
-          projects.appendRunLog(logFile, { t: Date.now(), ...ev });
-          send('run:event', { projectId, phaseId, ev });
+      if (op.cancelled) throw Object.assign(new Error('Step stopped. Select Run again to restart.'), { stopped: true });
+      const materials = (p.intake?.materials || []).filter((m) => m && existsSync(m));
+      // History mining reads git history the app saves itself, so the AI needs
+      // no shell for it (Claude Code has none on Windows).
+      if (phaseId === 'mining') {
+        for (const line of await saveGitHistory(p.folder, materials, LAYOUT.gitHistoryDir)) say('gate', line);
+      }
+      // PDF and Word material gets text copies every AI can read (Claude Code
+      // needs Poppler for PDFs, which most Windows computers lack).
+      for (const line of await saveMaterialText(p.folder, materials, LAYOUT.materialText, toolsPython(pc))) say('gate', line);
+      // An internet drop is not the inventor's problem: the app keeps hold of
+      // the step, waits for the connection, and continues the same
+      // conversation (this attempt's own, never an older one).
+      const freshPrompt = (reply ? `${phase.task}\n\nThe inventor has answered your earlier questions; the answers are in ${LAYOUT.answers} (latest at the bottom). Use them.` : phase.task) + replyTask;
+      const host = family(engine) === 'claude' ? 'api.anthropic.com' : 'chatgpt.com';
+      let promptNow = prompt;
+      let resumeNow = resumeId;
+      for (;;) {
+        finalEv = null;
+        toolErrors.length = 0;
+        const handle = runEngine(
+          { engine, cliPath, pcPath: pc, repoRoot: REPO_ROOT, appDataDir: app.getPath('userData'), cwd: p.folder, systemText, prompt: promptNow, resumeId: resumeNow, settings, key, serverEnv: searchEnv(), readDirs: materials },
+          (ev) => {
+            if (ev.kind === 'final') finalEv = ev;
+            if (ev.kind === 'error') toolErrors.push(String(ev.text || '').slice(0, 2000));
+            if (ev.kind === 'toolResult' && ev.ok === false && /requested permissions to write/i.test(ev.text || '')) refusedWrites.push(String(ev.text).match(/write to (.+?), but/)?.[1] || '');
+            projects.appendRunLog(logFile, { t: Date.now(), ...ev });
+            send('run:event', { projectId, phaseId, ev });
+          }
+        );
+        op.stop = handle.stop;
+        setStage(projectId, op, 'ai');
+        res = await handle.done;
+        op.stop = null;
+        const failed = res.code !== 0 || !finalEv || finalEv.ok === false;
+        const failText = [finalEv && finalEv.ok === false ? finalEv.text : '', ...toolErrors].join('\n');
+        if (!failed || op.cancelled || res.signal || !NET_DROP.test(failText)) break;
+        if (drops >= MAX_DROP_RETRIES) {
+          op.netFailed = true;
+          break;
         }
-      );
-      op.stop = handle.stop;
-      setStage(projectId, op, 'ai');
-      res = await handle.done;
-      op.stop = null;
-      const failed = res.code !== 0 || !finalEv || finalEv.ok === false;
-      const failText = [finalEv && finalEv.ok === false ? finalEv.text : '', ...toolErrors].join('\n');
-      if (!failed || op.cancelled || res.signal || !NET_DROP.test(failText)) break;
-      if (drops >= MAX_DROP_RETRIES) {
-        op.netFailed = true;
-        break;
+        drops++;
+        run.drops = drops;
+        say('warn', 'The internet connection dropped. The step continues by itself when the connection is back.');
+        setStage(projectId, op, 'waiting-network');
+        const before = filesNow(projectId);
+        if (!(await waitForNetwork(host, op))) {
+          if (op.cancelled) break;
+          op.netFailed = true;
+          break;
+        }
+        // Work done before the drop judged the files as they were then. If they
+        // changed while the app waited, it cannot be continued honestly.
+        if (filesNow(projectId) !== before) throw new Error('Your files changed while the app waited for the internet. Run this step again.');
+        say('gate', 'Connection is back. Continuing the step.');
+        resumeNow = res.sessionId || null;
+        promptNow = resumeNow ? 'The internet connection dropped and has come back. Continue the same phase from where you stopped. Check which files you already changed before redoing anything. Remember the STATUS line at the end.' : freshPrompt;
       }
-      drops++;
-      run.drops = drops;
-      say('warn', 'The internet connection dropped. The step continues by itself when the connection is back.');
-      setStage(projectId, op, 'waiting-network');
-      const before = filesNow(projectId);
-      if (!(await waitForNetwork(host, op))) {
-        if (op.cancelled) break;
-        op.netFailed = true;
-        break;
-      }
-      // Work done before the drop judged the files as they were then. If they
-      // changed while the app waited, it cannot be continued honestly.
-      if (filesNow(projectId) !== before) throw new Error('Your files changed while the app waited for the internet. Run this step again.');
-      say('gate', 'Connection is back. Continuing the step.');
-      resumeNow = res.sessionId || null;
-      promptNow = resumeNow ? 'The internet connection dropped and has come back. Continue the same phase from where you stopped. Check which files you already changed before redoing anything. Remember the STATUS line at the end.' : freshPrompt;
+    } else {
+      say('gate', 'Retrying the second AI review of the saved filing recommendation.');
     }
     setStage(projectId, op, 'checks-after');
   } catch (err) {
@@ -532,7 +611,9 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
 
   // ---- what actually happened --------------------------------------------
   p = projects.loadProject(projectId);
-  const st = finalEv ? parseStatus(finalEv.text) : { status: 'error', reason: 'The AI returned no result. Run this step again.' };
+  const st = retrySecondOpinion
+    ? { status: 'done', reason: 'Retrying the second AI review of the saved filing recommendation.' }
+    : finalEv ? parseStatus(finalEv.text) : { status: 'error', reason: 'The AI returned no result. Run this step again.' };
   let state = st.status;
   // The process's own exit wins over anything the AI wrote before it.
   if (appError) {
@@ -613,7 +694,7 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
         if (op.decisionReview?.verdict === 'DISAGREE') {
           op.secondOpinion = 'DISAGREE-overridden';
           op.secondOpinionHash = op.decisionReview.hash;
-        } else if (op.decisionReview?.verdict === 'unavailable' && op.decisionReview.continuedByInventor) {
+        } else if (!retrySecondOpinion && op.decisionReview?.verdict === 'unavailable' && op.decisionReview.continuedByInventor) {
           op.secondOpinion = 'skipped-by-inventor';
         } else {
           op.decisionReview = await secondOpinion({ op, projectId, p, engine, pc, settings, logFile, say });
@@ -621,6 +702,7 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
             op.secondOpinion = 'AGREE';
             op.secondOpinionHash = op.decisionReview.hash;
             say('gate', 'The second AI agrees with going ahead.');
+            if (retrySecondOpinion) st.reason = 'The second AI agrees with going ahead.';
           } else {
             state = 'needs-input';
             st.reason = secondOpinionQuestion(p, op.decisionReview);
@@ -674,9 +756,9 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
     say('error', `Check failed: ${err.message}. Run this step again.`);
   }
 
-  // A question file belongs to a step that is waiting. Once the step ends any
-  // other way, a leftover one would only confuse.
-  if (state !== 'needs-input') removeInside(p.folder, questionsFile(phaseId));
+  // Keep questions while waiting for answers, including the recovery
+  // question when a second-opinion retry fails or is stopped.
+  if (state !== 'needs-input' && !(retrySecondOpinion && state === 'error')) removeInside(p.folder, questionsFile(phaseId));
 
   projects.update(projectId, (rec) => {
     // A no-go report replaced while the checks ran is not the one judged.
@@ -686,7 +768,7 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
       record.reason = 'The no-go report changed after the AI finished. Run step 6 again.';
     }
     const ph = rec.phases?.[phaseId] || {};
-    if (op.decisionReview) op.decisionReview.decisionHash = projects.fileHash(rec, LAYOUT.decision);
+    if (op.decisionReview && !(retrySecondOpinion && state === 'error')) op.decisionReview.decisionHash = projects.fileHash(rec, LAYOUT.decision);
     rec.phases = {
       ...(rec.phases || {}),
       [phaseId]: { ...ph, ...(phaseId === 'decision' ? { decisionReview: op.decisionReview } : {}), state, current: null, lastSession: res.sessionId ? { engine, sessionId: res.sessionId } : ph.lastSession, runs: [...(ph.runs || []), record].slice(-30) },
@@ -759,14 +841,18 @@ function handle(channel, fn) {
 }
 
 handle('env:get', (force) => env(force));
+handle('updates:check', (force) => checkUpdates(!!force));
 handle('settings:get', () => ({ ...loadSettings(), keys: keyStatus(), engines: ENGINES, repoRoot: REPO_ROOT }));
-handle('settings:set', (patch) => {
-  const allowed = ['draftEngine', 'reviewEngine', 'claudeModel', 'codexModel', 'codexEffort', 'workspace'];
-  return saveSettings(Object.fromEntries(Object.entries(patch || {}).filter(([k]) => allowed.includes(k))));
+handle('settings:set', async (patch) => {
+  const allowed = ['draftEngine', 'reviewEngine', 'claudeModel', 'codexModel', 'codexEffort', 'workspace', 'googleCloudProject'];
+  const before = loadSettings();
+  const saved = saveSettings(Object.fromEntries(Object.entries(patch || {}).filter(([k]) => allowed.includes(k))));
+  if (saved.googleCloudProject !== before.googleCloudProject) await gates.disconnect();
+  return saved;
 });
-handle('settings:setKey', (name, value) => {
+handle('settings:setKey', async (name, value) => {
   const r = setKey(name, value);
-  if (name === 'serpapi') gates.disconnect();
+  if (['serpapi', 'epoKey', 'epoSecret', 'uspto'].includes(name)) await gates.disconnect();
   return r;
 });
 handle('phases:list', () => PHASES);
@@ -866,7 +952,8 @@ handle('setup:install', async () => {
   // (downloaded into the app's own folder), so the computer's own Python, or
   // the lack of one, never matters.
   await loginShellPath();
-  const home = app.getPath('home');
+  // The same home folder the tool detection reads, so install and detection agree.
+  const home = os.homedir();
   const isWin = process.platform === 'win32';
   const log = (l) => send('setup:line', l);
   const bin = (venv, name) => path.join(venv, isWin ? 'Scripts' : 'bin', isWin ? `${name}.exe` : name);
@@ -952,6 +1039,9 @@ handle('setup:install', async () => {
     }
     throw new Error(`${label} failed (code ${r.code}). Read the setup log for the cause.`);
   }
+  // The tools' own setup ends with advice for people using them in a terminal
+  // (restart Claude Code, install the plugin). This app connects them itself.
+  log('▸ Done. Any steps above about Claude Code or a terminal are for people using the tools without this app. There is nothing more to do here.');
   // A saved path to some other copy would keep the app on that copy.
   const saved = loadSettings().patentCreatorPath;
   if (saved && path.resolve(saved) !== path.resolve(pc)) saveSettings({ patentCreatorPath: pc });
@@ -962,24 +1052,46 @@ handle('setup:installTool', async (name) => {
   if (!['claude', 'codex'].includes(name)) throw new Error('This tool is unavailable. Reopen Setup.');
   await installers.installTool(name, (l) => send('setup:line', l));
   envCache = null;
-  return env(true);
+  const after = await env(true);
+  if (!after[name]?.installed) throw new Error(`The installer finished, but ${name === 'claude' ? 'Claude Code' : 'Codex'} was not found. Read the setup log, then select Install again.`);
+  return after;
 });
 handle('setup:login', async (name) => {
   if (!['claude', 'codex'].includes(name)) throw new Error('This tool is unavailable. Reopen Setup.');
-  const e = await env(true);
-  const cli = e[name]?.path;
-  if (!cli) throw new Error('The AI tool is missing. Install it in Setup.');
-  const r = await installers.startLogin(name, cli, {
-    onLine: (l) => send('setup:line', l),
-    onUrl: (url) => {
-      shell.openExternal(url);
-      send('setup:login', { name, url, needsCode: name === 'claude' });
-    },
-  });
-  envCache = null;
-  const after = await env(true);
-  if (!after[name]?.loggedIn) throw new Error(r.ok ? 'Sign-in could not be confirmed. Select Sign in again.' : 'Sign-in did not finish. Select Sign in again.');
-  return after;
+  if (loginRequests.has(name)) throw new Error('Sign-in is already open. Finish it in your browser.');
+  const request = { cancelled: false };
+  loginRequests.set(name, request);
+  try {
+    const e = await env(true);
+    if (request.cancelled) return { cancelled: true };
+    const cli = e[name]?.path;
+    if (!cli) throw new Error('The AI tool is missing. Install it in Setup.');
+    const r = await installers.startLogin(name, cli, {
+      onLine: (l) => send('setup:line', l),
+      onUrl: (url) => {
+        shell.openExternal(url);
+        send('setup:login', { name, url, needsCode: name === 'claude' });
+      },
+    });
+    if (request.cancelled || r.cancelled) return { cancelled: true };
+    envCache = null;
+    const after = await env(true);
+    if (request.cancelled) return { cancelled: true };
+    if (!after[name]?.loggedIn) throw new Error(r.ok ? 'Sign-in could not be confirmed. Select Sign in again.' : 'Sign-in did not finish. Select Sign in again.');
+    return after;
+  } catch (err) {
+    if (request.cancelled) return { cancelled: true };
+    throw err;
+  } finally {
+    loginRequests.delete(name);
+    send('setup:login', { name, needsCode: false });
+  }
+});
+handle('setup:cancelLogin', (name) => {
+  if (!['claude', 'codex'].includes(name)) throw new Error('This tool is unavailable. Reopen Setup.');
+  const request = loginRequests.get(name);
+  if (request) request.cancelled = true;
+  installers.cancelLogin(name);
 });
 handle('setup:loginCode', (name, code) => installers.sendLoginCode(name, code));
 handle('shell:openExternal', (url) => /^https?:\/\//.test(url) && shell.openExternal(url));
@@ -1010,6 +1122,7 @@ app.whenReady().then(async () => {
   await loginShellPath();
   createWindow();
   env().catch(() => {});
+  checkUpdates();
 });
 app.on('window-all-closed', async () => {
   for (const op of ops.values()) op.stop?.();

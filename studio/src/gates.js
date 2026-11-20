@@ -92,12 +92,38 @@ export async function callTool(pcPath, name, args = {}) {
 }
 
 export async function searchStatus(pcPath) {
-  const [google, bigquery] = await Promise.all([
+  const [google, epo, uspto, bigquery] = await Promise.all([
     callTool(pcPath, 'check_google_patents_status').catch((e) => ({ ready: false, error: e.message })),
-    callTool(pcPath, 'check_bigquery_status').catch((e) => ({ ready: false, error: e.message })),
+    callTool(pcPath, 'check_epo_api_status').catch((e) => ({ ready: false, error: e.message })),
+    callTool(pcPath, 'check_uspto_api_status').catch((e) => ({ ready: false, error: e.message })),
+    callTool(pcPath, 'check_bigquery_status').catch((e) => ({ available: false, error: e.message })),
   ]);
-  const bqReady = bigquery?.ready ?? bigquery?.available ?? bigquery?.configured ?? false;
-  return { google, bigquery, ready: !!google?.ready || !!bqReady, checkedAt: new Date().toISOString() };
+  const sources = [google?.ready && 'Google Patents', epo?.ready && 'EPO', uspto?.ready && 'USPTO', bigquery?.available && 'BigQuery'].filter(Boolean);
+  const status = { google, epo, uspto, bigquery, ready: !!google?.ready || !!epo?.ready || !!bigquery?.available, sources, checkedAt: new Date().toISOString() };
+  return { ...status, reasons: searchReasons(status) };
+}
+
+export function searchReasons(status) {
+  if (status.error) return ['the patent search check could not finish'];
+  return [['google', 'Google Patents'], ['epo', 'EPO'], ['uspto', 'USPTO'], ['bigquery', 'BigQuery']].flatMap(([key, name]) => {
+    const source = status[key];
+    if (source?.ready || source?.available) return [];
+    const text = `${source?.error || ''} ${source?.message || ''}`;
+    let reason = 'the service check could not finish';
+    if (key === 'google' && typeof source?.searches_left === 'number' && source.searches_left <= 0) reason = 'no searches left this month';
+    else if (/quota|limit|429|no .*searches.*left/i.test(text)) reason = 'the usage limit was reached';
+    else if (/xmltodict/i.test(text)) reason = 'the patent tools need an update in Setup';
+    else if (source?.credentials_configured === false || source?.api_key_configured === false || /not configured|not installed|not set|no .*key|needs a free SerpApi key|set .*environment|GOOGLE_CLOUD_PROJECT|default credentials.*not found/i.test(text)) reason = 'not set up';
+    else if (/401|403|unauthori[sz]ed|forbidden|invalid.*key|key.*invalid|invalid_client/i.test(text)) reason = key === 'bigquery' ? 'access was refused' : 'the key was refused';
+    else if (/timed?\s*out|timeout/i.test(text)) reason = 'the service took too long to reply';
+    else if (/connect|network|ENOTFOUND|ENETUNREACH|fetch|request failed/i.test(text)) reason = 'could not connect to the service';
+    else if (/HTTP 5\d\d|server error|unavailable/i.test(text)) reason = 'the service is temporarily unavailable';
+    else if (/authentication failed/i.test(text)) reason = key === 'bigquery' ? 'access was refused' : 'the key was refused';
+    else if (/unreadable|invalid.*response/i.test(text)) reason = 'the service returned an unreadable reply';
+    // USPTO and BigQuery are extras; they are named only when set up and failing.
+    if (reason === 'not set up' && (key === 'uspto' || key === 'bigquery')) return [];
+    return [`${name}: ${reason}`];
+  });
 }
 
 function readIf(dir, rel) {

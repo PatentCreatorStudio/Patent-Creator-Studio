@@ -34,9 +34,24 @@ export function renderSettings() {
       </div>
       <div class="card stack">
         <h2>Patent search</h2>
-        <p class="muted" style="margin:0">Add a SerpApi key to search Google Patents. Check the search allowance when you sign up. An existing patent-tools key also works here.</p>
+        <h3>Google Patents</h3>
+        <p class="muted" style="margin:0">Search patent text worldwide with a SerpApi key. Check the search allowance when you sign up. <a href="#" data-ext="https://serpapi.com/users/sign_up">Get a SerpApi key</a>.</p>
         <label class="field">SerpApi key ${s.keys.serpapi ? '<span class="pill good">saved</span>' : ''}<input type="password" id="k-serp" placeholder="Paste to set or replace"></label>
-        <div class="row"><button class="btn" id="save-serp">Save search key</button><a href="#" data-ext="https://serpapi.com/users/sign_up">Get a search key</a></div>
+        ${s.keys.serpapi ? '<div><button class="btn ghost sm" data-clear="serpapi">Remove SerpApi key</button></div>' : ''}
+        <h3>European Patent Office</h3>
+        <p class="muted" style="margin:0">Search patent titles, abstracts and classifications worldwide. Registration is free. <a href="#" data-ext="https://developers.epo.org/">Get an EPO key and secret</a>.</p>
+        <label class="field">EPO key ${s.keys.epoKey ? '<span class="pill good">saved</span>' : ''}<input type="password" id="k-epo" placeholder="Paste to set or replace"></label>
+        <label class="field">EPO secret ${s.keys.epoSecret ? '<span class="pill good">saved</span>' : ''}<input type="password" id="k-epo-secret" placeholder="Paste to set or replace"></label>
+        <div class="row">${s.keys.epoKey ? '<button class="btn ghost sm" data-clear="epoKey">Remove EPO key</button>' : ''}${s.keys.epoSecret ? '<button class="btn ghost sm" data-clear="epoSecret">Remove EPO secret</button>' : ''}</div>
+        <h3>USPTO</h3>
+        <p class="muted" style="margin:0">Search US patent application details, such as applicants and filing dates. Access is free and requires identity verification at sign-up. <a href="#" data-ext="https://data.uspto.gov/myodp">Get a USPTO key</a>.</p>
+        <label class="field">USPTO key ${s.keys.uspto ? '<span class="pill good">saved</span>' : ''}<input type="password" id="k-uspto" placeholder="Paste to set or replace"></label>
+        ${s.keys.uspto ? '<div><button class="btn ghost sm" data-clear="uspto">Remove USPTO key</button></div>' : ''}
+        <h3>Google BigQuery</h3>
+        <p class="muted" style="margin:0">Search patent text worldwide through a Google Cloud billing project. <a href="#" data-ext="https://console.cloud.google.com/projectcreate">Create a project</a>.</p>
+        <p class="muted" style="margin:0">Needs a Google Cloud sign-in on this computer. Run <code>gcloud auth application-default login</code> in a terminal. Each keyword search scans about 341 GiB. The free allowance covers about three searches a month; further searches are billed to your project.</p>
+        <label class="field">Google Cloud project ID ${s.googleCloudProject ? '<span class="pill good">saved</span>' : ''}<input type="text" id="s-gcp" value="${esc(s.googleCloudProject || '')}" placeholder="your-project-id"></label>
+        <div class="row"><button class="btn" id="save-search">Save search settings</button>${s.googleCloudProject ? '<button class="btn ghost sm" id="clear-project">Remove project ID</button>' : ''}</div>
       </div>
       <div class="card stack">
         <h2>Where inventions are kept</h2>
@@ -53,7 +68,7 @@ export function renderSettings() {
       })
   );
   $('#save-s').onclick = async () => {
-    const patch = { draftEngine: s.draftEngine, reviewEngine: s.reviewEngine, claudeModel: $('#s-cm').value.trim(), codexModel: $('#s-xm').value.trim(), codexEffort: $('#s-xe').value };
+    const patch = { draftEngine: s.draftEngine, reviewEngine: s.reviewEngine, claudeModel: $('#s-cm').value.trim(), codexModel: $('#s-xm').value.trim(), codexEffort: $('#s-xe').value, googleCloudProject: $('#s-gcp').value.trim() };
     if (engineFamily(patch.draftEngine) === engineFamily(patch.reviewEngine)) toast('The writer and reviewer use the same AI. Choose the other AI for the review.', true);
     const saved = await attempt(() => S.saveSettings(patch));
     state.settings = await S.settings();
@@ -77,15 +92,22 @@ export function renderSettings() {
         renderSettings();
       })
   );
-  $('#save-serp').onclick = async () => {
-    const v = $('#k-serp').value.trim();
-    if (!v) return toast('Paste the key first.', true);
-    if (await attempt(() => S.setKey('serpapi', v))) {
+  $('#save-search').onclick = async () => {
+    for (const [name, selector] of Object.entries({ serpapi: '#k-serp', epoKey: '#k-epo', epoSecret: '#k-epo-secret', uspto: '#k-uspto' })) {
+      const value = $(selector).value.trim();
+      if (value && !(await attempt(() => S.setKey(name, value)))) return;
+    }
+    if (await attempt(() => S.saveSettings({ googleCloudProject: $('#s-gcp').value.trim() }))) {
       state.settings = await S.settings();
-      toast('Search key saved.');
+      toast('Search settings saved.');
       renderSettings();
     }
   };
+  $('#clear-project')?.addEventListener('click', async () => {
+    if (!(await attempt(() => S.saveSettings({ googleCloudProject: '' })))) return;
+    state.settings = await S.settings();
+    renderSettings();
+  });
   $('#pick-ws').onclick = async () => {
     const d = await guard(() => S.pickWorkspace());
     if (d) {

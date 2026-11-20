@@ -154,7 +154,7 @@ export async function pythonVersion(py) {
 // (0.3.0rc1, 0.3.0b2, 0.3.0.dev1) before its final release. -1, 0 or 1.
 export function compareVersions(a, b) {
   const parse = (v) => {
-    const m = String(v || '').trim().toLowerCase().match(/^v?(\d+(?:\.\d+)*)(?:[-_.]?(dev|a|alpha|b|beta|c|rc|pre|preview)[-_.]?(\d*))?/);
+    const m = String(v || '').trim().toLowerCase().match(/^v?(\d+(?:\.\d+)*)(?:[-_.]?(dev|alpha|a|beta|b|rc|c|preview|pre)[-_.]?(\d*))?/);
     if (!m) return null;
     const rank = { dev: 0, a: 1, alpha: 1, b: 2, beta: 2, c: 3, rc: 3, pre: 3, preview: 3 };
     return { nums: m[1].split('.').map(Number), pre: m[2] ? [rank[m[2]], Number(m[3] || 0)] : [9, 0] };

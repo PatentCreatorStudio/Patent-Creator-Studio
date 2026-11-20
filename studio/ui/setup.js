@@ -1,30 +1,40 @@
 // Setup: what is installed on this computer and what is still needed.
-import { S, $, main, state, esc, toast, guard } from './core.js';
+import { S, $, main, state, esc, toast, guard, aiAvailable, updateNotice } from './core.js';
 import { renderSidebar } from './app.js';
 
 // One AI tool: install it, sign in, or say it is ready. Each button runs the
 // maker's own installer or sign-in; nothing needs a terminal.
-function aiItem(name, title, t, otherReady, how, pitch) {
+function aiItem(name, title, t, keySaved, otherReady, how, pitch) {
   const busy = state.toolBusy === name;
-  const ok = t.installed && t.loggedIn;
+  const ok = t.installed && (t.loggedIn || keySaved);
   const icon = ok ? '✅' : otherReady ? '◻️' : '⚠️';
   const text = !t.installed
     ? `Not installed. ${pitch}`
     : t.loggedIn
       ? `Installed (${esc(t.version || '')}) and signed in${how}.`
-      : `Installed but not signed in. ${pitch}`;
+      : keySaved
+        ? `Installed (${esc(t.version || '')}). Runs on your saved API key.`
+        : `Installed. Sign in to use it. ${pitch}`;
   const btn = ok ? '' : `<button class="btn primary" data-tool="${name}" data-act="${t.installed ? 'login' : 'install'}" ${busy || state.toolBusy ? 'disabled' : ''}>${busy ? 'Working…' : t.installed ? 'Sign in' : 'Install'}</button>`;
-  return `<div class="check-item"><div class="ci-icon">${icon}</div><div><b>${title}</b><p>${text}</p></div><div>${btn}</div></div>`;
+  const cancel = busy && state.toolAction === 'login' ? `<button class="btn" data-cancel-login="${name}" ${state.loginCancelling ? 'disabled' : ''}>Cancel</button>` : '';
+  return `<div class="check-item"><div class="ci-icon">${icon}</div><div><b>${title}</b><p>${text}</p></div><div class="row">${btn}${cancel}</div></div>`;
 }
 
 async function toolAction(name, act) {
   state.toolBusy = name;
+  state.toolAction = act;
+  state.loginCancelling = false;
   state.setupLog = [act === 'install' ? `Installing ${name === 'claude' ? 'Claude Code' : 'Codex'}…` : 'Opening the sign-in page in your browser…'];
   renderSetup();
   const r = await guard(() => (act === 'install' ? S.installTool(name) : S.login(name)));
   state.toolBusy = null;
+  state.toolAction = null;
+  state.loginCancelling = false;
   state.loginCode = null;
-  if (r) ((state.env = r), toast(act === 'install' ? 'Installed. Now sign in.' : 'Signed in.'));
+  if (r?.cancelled) {
+    state.setupLog.push('Sign-in cancelled.');
+    toast('Sign-in cancelled.');
+  } else if (r) ((state.env = r), toast(act === 'install' ? (aiAvailable(name, r) ? 'Installed and ready.' : 'Installed. Now sign in.') : 'Signed in.'));
   renderSetup();
   renderSidebar();
 }
@@ -70,14 +80,16 @@ export function renderSetup() {
     `<div class="check-item"><div class="ci-icon">${ok === true ? '✅' : ok === 'opt' ? '◻️' : '⚠️'}</div><div><b>${title}</b><p>${text}</p></div><div>${action}</div></div>`;
   main.innerHTML = `<div class="page" style="max-width:860px">
     <div class="page-head"><div><h1>Setup</h1><p class="lede">Install the patent tools and one AI to start. Set up both Claude Code and Codex for the second AI review.</p></div><button class="btn" id="recheck">Check again</button></div>
+    ${state.update?.error ? `<p class="small">${esc(state.update.error)}</p>` : ''}
+    ${state.update?.newer ? `<p class="small">${updateNotice()}</p>` : ''}
     ${
       !e
         ? '<div class="card muted">Checking installed tools…</div>'
         : `<div class="card">
       ${toolsItem(e.patentCreator, item)}
-      ${aiItem('claude', 'Claude Code', e.claude, e.codex.loggedIn, e.claude.authMethod === 'claude.ai' ? ' with your Claude subscription' : '', 'Use your Claude subscription, or add an Anthropic API key in Settings.')}
-      ${aiItem('codex', 'Codex', e.codex, e.claude.loggedIn, '', 'Use your ChatGPT subscription, or add an OpenAI API key in Settings.')}
-      ${state.loginCode ? `<div class="check-item"><div class="ci-icon">🔑</div><div><b>Finish signing in to Claude</b><p>Sign in in your browser, then paste the code shown there.</p><div class="row"><input id="login-code" placeholder="Paste the code here" style="flex:1"><button class="btn primary" id="login-send">Finish sign-in</button></div></div><div></div></div>` : ''}
+      ${aiItem('claude', 'Claude Code', e.claude, k.anthropic, aiAvailable('codex'), e.claude.authMethod === 'claude.ai' ? ' with your Claude subscription' : '', 'Needs a Claude Pro plan or higher, or an Anthropic API key in Settings.')}
+      ${aiItem('codex', 'Codex', e.codex, k.openai, aiAvailable('claude'), '', 'Needs a ChatGPT plan that includes Codex, or an OpenAI API key in Settings.')}
+      ${state.loginCode ? `<div class="check-item"><div class="ci-icon">🔑</div><div><b>Finish signing in to Claude</b><p>Sign in in your browser, then paste the code shown there.</p><div class="row"><input id="login-code" placeholder="Paste the code here" style="flex:1"><button class="btn primary" id="login-send" ${state.loginCancelling ? 'disabled' : ''}>Finish sign-in</button><button class="btn" data-cancel-login="${state.loginCode}" ${state.loginCancelling ? 'disabled' : ''}>Cancel</button></div></div><div></div></div>` : ''}
       ${item(k.anthropic || k.openai ? true : 'opt', 'API keys (optional)', `Anthropic key: ${k.anthropic ? 'saved' : 'none'} · OpenAI key: ${k.openai ? 'saved' : 'none'}. For pay-per-use billing, add a key in Settings.`)}
       ${item(e.graphviz.installed ? true : 'opt', 'Graphviz (optional, for drawings)', e.graphviz.installed ? 'Installed. Arranges flowcharts and block diagrams.' : 'Optional tool for arranging flowcharts. The AI can also draw figures directly.')}
       <div id="search-item"></div>
@@ -87,12 +99,17 @@ export function renderSetup() {
   </div>`;
   $('#recheck').onclick = async () => {
     main.querySelector('.card').innerHTML = '<span class="muted">Checking installed tools…</span>';
-    state.env = await guard(() => S.env(true));
+    [state.env, state.update] = await Promise.all([guard(() => S.env(true)), S.checkUpdates(true)]);
     state.settings = await S.settings();
     renderSetup();
     renderSidebar();
   };
   main.querySelectorAll('[data-tool]').forEach((b) => (b.onclick = () => toolAction(b.dataset.tool, b.dataset.act)));
+  main.querySelectorAll('[data-cancel-login]').forEach((b) => (b.onclick = async () => {
+    state.loginCancelling = true;
+    renderSetup();
+    await guard(() => S.cancelLogin(b.dataset.cancelLogin));
+  }));
   $('#login-send')?.addEventListener('click', async () => {
     const code = $('#login-code').value.trim();
     if (!code) return;
@@ -112,12 +129,11 @@ export function renderSetup() {
     box.innerHTML = item('opt', 'Patent search', 'Checking…');
     S.searchStatus()
       .then((st) => {
+        const sources = (st.sources || []).map((name) => name === 'Google Patents' ? `Google Patents (${st.google.searches_left ?? '?'} searches left)` : name).join(', ');
         box.innerHTML = item(
           st.ready ? true : false,
           'Patent search',
-          st.ready
-            ? `On${st.google?.ready ? ` (Google Patents, ${esc(st.google.searches_left ?? '?')} searches left on ${esc(st.google.plan || 'your SerpApi account')})` : ' (BigQuery)'}.`
-            : 'Off. To assess whether filing is worth pursuing, add a <a href="https://serpapi.com/users/sign_up">SerpApi search key</a> in Settings.'
+          (sources ? `On: ${esc(sources)}. ` : '') + (st.ready ? '' : `Patent search is off (${esc(st.reasons.join('; '))}). Add a Google Patents (SerpApi) key or free EPO keys in Settings to search patents.`)
         );
       })
       .catch((err) => (box.innerHTML = item(false, 'Patent search', esc(err.message))));

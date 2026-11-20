@@ -106,7 +106,10 @@ export function renderChecks(body) {
   $('#srch').onclick = async () => {
     $('#search-box').innerHTML = '<div class="card muted">Checking…</div>';
     const st = await guard(() => S.searchStatus());
-    if (st) $('#search-box').innerHTML = `<div class="card"><h3>Patent search</h3><p>${st.ready ? 'On.' : 'Not set up. Add a search key in Settings.'}</p><div class="raw small">${esc(JSON.stringify({ google: st.google, bigquery: st.bigquery }, null, 2))}</div></div>`;
+    if (st) {
+      const sources = (st.sources || []).map((name) => name === 'Google Patents' ? `Google Patents (${st.google.searches_left ?? '?'} searches left)` : name).join(', ');
+      $('#search-box').innerHTML = `<div class="card"><h3>Patent search</h3><p>${sources ? `On: ${esc(sources)}. ` : ''}${st.ready ? '' : 'Patent search is off. Add Google Patents or EPO keys in Settings.'}</p><div class="raw small">${esc(JSON.stringify({ google: st.google, epo: st.epo, uspto: st.uspto, bigquery: st.bigquery }, null, 2))}</div></div>`;
+    }
   };
 }
 

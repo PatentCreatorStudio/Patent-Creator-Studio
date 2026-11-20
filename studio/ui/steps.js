@@ -16,6 +16,10 @@ const WORDS = {
 };
 const NUM_CLASS = { todo: 'idle', running: 'running', done: 'done', 'no-go': 'nogo', blocked: 'attention', stale: 'attention', 'needs-input': 'attention', error: 'error' };
 const PILL_CLASS = { done: 'good', 'no-go': '', blocked: 'warn', stale: 'warn', 'needs-input': 'warn', error: 'bad', running: '' };
+const noGoLabel = (p, ph) => ph.requiresGo && p.stamps?.decision?.state === 'no-go' && p.stamps.decision.decision === 'NO-GO' && p.stamps.decision.overruledByInventor
+  ? "Stopped: the draft can't be finished from your material"
+  : WORDS['no-go'];
+const statusLabel = (p, ph, status) => status === 'no-go' ? noGoLabel(p, ph) : WORDS[status];
 
 export function renderSteps(body) {
   const p = state.project;
@@ -26,7 +30,7 @@ export function renderSteps(body) {
           const s = p.steps[ph.id];
           return `<button class="step ${ph.id === state.phaseId ? 'active' : ''} ${s.locked ? 'locked' : ''}" data-id="${ph.id}">
             <span class="num ${NUM_CLASS[s.status]}">${s.status === 'done' ? '✓' : ph.n}</span>
-            <span><div class="s-title">${esc(ph.title)}</div><div class="s-sub">${esc(s.locked && s.status === 'todo' ? s.locked : WORDS[s.status])}</div></span>
+            <span><div class="s-title">${esc(ph.title)}</div><div class="s-sub">${esc(s.locked && s.status === 'todo' ? s.locked : statusLabel(p, ph, s.status))}</div></span>
           </button>`;
         })
         .join('')}
@@ -80,7 +84,7 @@ function renderPhasePanel(el) {
   el.innerHTML = `<div class="card phase-panel">
     <div class="ph-head">
       <div style="flex:1">
-        <div class="row"><span class="pill ${PILL_CLASS[step.status] ?? 'idle'}">${WORDS[step.status]}</span><span class="muted small">${esc(ph.time)}</span></div>
+        <div class="row"><span class="pill ${PILL_CLASS[step.status] ?? 'idle'}">${esc(statusLabel(p, ph, step.status))}</span><span class="muted small">${esc(ph.time)}</span></div>
         <h2 style="margin-top:8px">${ph.n}. ${esc(ph.title)}</h2>
         <p>${esc(ph.plain)}</p>
         ${rule ? `<p class="small muted">${esc(rule)}</p>` : ''}
@@ -89,7 +93,7 @@ function renderPhasePanel(el) {
     ${step.status === 'stale' && !step.locked ? `<div class="summary-box attention"><b>Run this step again.</b> ${esc(step.note)}</div>` : ''}
     ${
       step.locked
-        ? `<div class="summary-box attention">${esc(step.locked)}${p.readiness.level === 'nogo' ? ' See the decision report for the evidence.' : ''}</div>`
+        ? `<div class="summary-box attention">${esc(step.locked)}${p.readiness.level === 'nogo' ? ` ${esc(p.readiness.detail)}` : ''}</div>`
         : `<div class="controls">
       <select id="engine" ${busy ? 'disabled' : ''}>
         ${Object.entries(engines)
@@ -106,7 +110,7 @@ function renderPhasePanel(el) {
       ${busy && !mine ? `<span class="muted small">${p.running ? 'Another step is running for this invention.' : "The app's checks are running."}</span>` : ''}
     </div>`
     }
-    ${last ? lastRunBox(last) : ''}
+    ${last ? lastRunBox(last, p, ph) : ''}
     ${
       ph.id === 'decision' && step.status === 'no-go'
         ? p.stamps?.decision?.overruledByInventor
@@ -191,14 +195,14 @@ async function overruleDialog(p) {
   };
 }
 
-function lastRunBox(last) {
+function lastRunBox(last, p, ph) {
   const cls = last.status === 'error' ? 'error' : ['needs-input', 'blocked'].includes(last.status) ? 'attention' : '';
   const label =
     {
       done: 'Finished',
       'done-unconfirmed': 'Files created; completion unconfirmed',
       'needs-input': 'Needs your answers',
-      'no-go': 'Not worth filing',
+      'no-go': noGoLabel(p, ph),
       blocked: 'Blocked: read the summary',
       error: 'Did not finish',
     }[last.status] || last.status;

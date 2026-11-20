@@ -36,7 +36,7 @@ Claude Code needs a paid Claude plan (Pro or higher) or an API key. The free pla
 
 ### First run
 
-In **Setup**, install the patent tools and sign in to Claude Code or Codex. For API billing, add your key in **Settings**. Add a free SerpApi key in Settings to search Google Patents.
+In **Setup**, install the patent tools and sign in to Claude Code or Codex. For API billing, add your key in **Settings**. Add a free SerpApi key (Google Patents) or free EPO keys in Settings to search patents. Step 2 waits until one of them works.
 
 ## Run from source
 
@@ -108,4 +108,10 @@ Probed against the real code earlier: forged records ignored, `RED TEAM: FAIL` w
 
 Windows, November 13 and 14: the installer runs without administrator rights, Setup installs the patent tools with graphics card support, and a test invention ran steps 0 to 3 to a no-go with Codex and Claude. Closing the app mid-step and reopening it recovers.
 
-Not yet exercised: the two API-key options with real keys, Codex as the writer with Claude attacking, steps 4 to 8 on Windows, and a computer that has never had Claude Code or Codex installed.
+Windows, November 16 and 17: Update refuses while another program holds the patent tools, updates 0.2.0 to 0.3.0 in place with the rulebook unchanged, and rebuilds a Python 3.9 install on 3.12. A real invention ran through step 6.
+
+Mac, November 17: Codex wrote steps 4 to 7 with Claude attacking at step 8, after File anyway, through three fix rounds. Stop while a step waits for the internet ends it within a second and frees the invention.
+
+Mac, November 20, on an empty home folder with no Claude Code, Codex, Python, uv or patent tools: Setup installed Claude Code and Codex with their makers' installers, then the patent tools on their own Python 3.12, and built the rulebook (66,692 passages) in about 36 minutes, all from the app's buttons. A saved API key counts as ready, and Cancel ends a waiting sign-in.
+
+Not yet exercised: the two API-key options with real keys, steps 7 and 8 on Windows, a computer with no Graphviz, and the step 3 retry ("ready") and patent-search-off stop with a live AI, which wait on a working patent search key.

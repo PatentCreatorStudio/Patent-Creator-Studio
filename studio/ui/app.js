@@ -1,6 +1,6 @@
 // The frame around every screen: the sidebar, moving between screens, and
 // starting up. Each screen lives in its own file.
-import { S, $, main, state, esc, guard, ago, levelClass } from './core.js';
+import { S, $, main, state, esc, guard, ago, levelClass, aiAvailable, updateNotice } from './core.js';
 import { renderProject, showProject } from './project.js';
 import { intakeModal } from './intake.js';
 import { renderSetup } from './setup.js';
@@ -27,9 +27,10 @@ export async function renderSidebar() {
   document.querySelectorAll('.navlink').forEach((b) => b.classList.toggle('active', state.view === b.dataset.view));
   const e = state.env;
   if (e) $('#setup-dot').className = 'dot ' + (toolsReady(e) ? 'good' : 'warn');
+  $('#update-notice').innerHTML = updateNotice();
 }
 
-const toolsReady = (e) => e.patentCreator.ready && !e.patentCreator.outdated && ((e.claude.installed && e.claude.loggedIn) || (e.codex.installed && e.codex.loggedIn));
+const toolsReady = (e) => e.patentCreator.ready && !e.patentCreator.outdated && (aiAvailable('claude', e) || aiAvailable('codex', e));
 
 document.querySelectorAll('.navlink').forEach((b) => (b.onclick = () => go(b.dataset.view)));
 $('#new-btn').onclick = () => intakeModal();
@@ -92,6 +93,11 @@ S.on('project:changed', (p) => {
 (async function boot() {
   state.phases = await S.phases();
   state.settings = await S.settings();
+  S.checkUpdates().then((update) => {
+    state.update = update;
+    renderSidebar();
+    if (state.view === 'setup') renderSetup();
+  });
   render();
   state.env = await guard(() => S.env());
   render();

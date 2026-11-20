@@ -2,7 +2,7 @@
 // official installer, so nobody has to open a terminal. Every installer here
 // installs into the person's home folder and needs no administrator rights.
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { streamCommand, childEnv, launchable } from './env.js';
@@ -17,16 +17,24 @@ const OFFICIAL = {
   uv: { label: 'the Python manager (uv)', sh: 'https://astral.sh/uv/install.sh', shell: 'sh', ps: 'https://astral.sh/uv/install.ps1' },
 };
 
-export function runOfficialInstaller(name, { onLine, env = {} } = {}) {
+export async function runOfficialInstaller(name, { onLine, env = {} } = {}) {
   const o = OFFICIAL[name];
   const e = childEnv(env);
   // Windows PowerShell 5.1 runs the installer. If the app was started from a
   // PowerShell 7 window it inherits 7's module list and cannot load its own
   // security module; without the variable, 5.1 rebuilds its default list.
   if (IS_WIN) for (const k of Object.keys(e)) if (k.toLowerCase() === 'psmodulepath') delete e[k];
-  return IS_WIN
-    ? streamCommand('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', `irm ${o.ps} | iex`], { onLine, env: e })
-    : streamCommand('/bin/sh', ['-c', `curl -fsSL ${o.sh} | ${o.shell}`], { onLine, env: e });
+  if (IS_WIN) return streamCommand('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', `$ErrorActionPreference='Stop'; try { $s = irm '${o.ps}'; iex $s } catch { Write-Error $_; exit 1 }`], { onLine, env: e });
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'patent-creator-install-'));
+  const script = path.join(dir, 'install.sh');
+  try {
+    // Download first so a failed transfer cannot look like a finished install.
+    const download = await streamCommand('curl', ['-fsSL', '-o', script, o.sh], { onLine, env: e });
+    if (!download.ok) throw new Error(`Could not download the ${o.label} installer. Check your internet connection, then select Install again.`);
+    return await streamCommand(o.shell, [script], { onLine, env: e });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 export async function installTool(name, onLine) {
@@ -55,11 +63,13 @@ export function startLogin(name, cliPath, { onLine, onUrl }) {
   const args = name === 'claude' ? ['auth', 'login', '--claudeai'] : ['login'];
   const l = launchable(cliPath, args);
   const child = spawn(l.cmd, l.args, { env: childEnv(), stdio: ['pipe', 'pipe', 'pipe'] });
-  logins.set(name, child);
+  const login = { child, cancelled: false, timer: null };
+  logins.set(name, login);
   let sent = false;
   const feed = (buf) => {
     for (const l of String(buf).split(/\r?\n|\r/)) {
       if (!l.trim()) continue;
+      if (login.cancelled) return;
       onLine?.(l);
       const m = !sent && l.match(/https:\/\/\S+/);
       if (m && /oauth|authorize/i.test(m[0])) ((sent = true), onUrl?.(m[0]));
@@ -68,16 +78,29 @@ export function startLogin(name, cliPath, { onLine, onUrl }) {
   child.stdout.on('data', feed);
   child.stderr.on('data', feed);
   return new Promise((resolve) => {
-    child.on('error', (e) => (logins.delete(name), resolve({ ok: false, error: e.message })));
-    child.on('close', (code) => (logins.delete(name), resolve({ ok: code === 0, code })));
+    const finish = (result) => {
+      clearTimeout(login.timer);
+      if (logins.get(name) === login) logins.delete(name);
+      resolve({ ...result, cancelled: login.cancelled });
+    };
+    child.on('error', (e) => finish({ ok: false, error: e.message }));
+    child.on('close', (code) => finish({ ok: code === 0, code }));
   });
 }
 export function sendLoginCode(name, code) {
-  const child = logins.get(name);
-  if (!child) throw new Error('Sign-in has closed. Select Sign in again.');
-  child.stdin.write(String(code).trim() + '\n');
+  const login = logins.get(name);
+  if (!login || login.cancelled) throw new Error('Sign-in has closed. Select Sign in again.');
+  login.child.stdin.write(String(code).trim() + '\n');
+}
+export function cancelLogin(name) {
+  const login = logins.get(name);
+  if (!login || login.cancelled) return;
+  login.cancelled = true;
+  login.child.kill();
+  // A stuck sign-in must still let the person try again.
+  login.timer = setTimeout(() => login.child.kill('SIGKILL'), 2000);
+  login.timer.unref();
 }
 export function cancelLogins() {
-  for (const c of logins.values()) c.kill();
-  logins.clear();
+  for (const name of logins.keys()) cancelLogin(name);
 }

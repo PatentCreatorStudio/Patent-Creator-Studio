@@ -136,7 +136,7 @@ function staleReason(p, phase, st, up) {
   if (st.state === 'no-go' && phase.id === 'verify') {
     if (!existsSync(path.join(p.folder, LAYOUT.noGo))) return `Missing: the no-go report (${LAYOUT.noGo}).`;
     if (st.noGo !== fingerprint(p, [LAYOUT.noGo])) return 'The no-go report was changed after the step finished.';
-    if (st.draft !== fingerprint(p, DRAFT_SET)) return 'The claims, description or drawings changed after this step said the idea is not worth filing.';
+    if (st.draft !== fingerprint(p, DRAFT_SET)) return 'The claims, description or drawings changed after this step stopped the campaign.';
     return null;
   }
   if (st.state === 'no-go' || st.state === 'blocked') return null;
@@ -233,11 +233,14 @@ export function readiness(p, steps = evaluate(p)) {
     return { level: 'blocked', label: 'Blocked', detail: 'The AI needs more information to make a recommendation.', decision, missing: ['Read the decision report for what to resolve before running step 3 again.'] };
   }
 
-  // A later step can still find the idea is not worth filing once the claims
-  // have been narrowed. That outcome replaces the earlier GO on screen.
+  // A later stop replaces the earlier decision on screen. After File anyway,
+  // it concerns whether the material supports a draft, not whether to file.
   const killer = PHASES.find((ph) => ph.requiresGo && steps[ph.id].status === 'no-go');
   if (killer) {
     const where = killer.id === 'verify' ? ` Read the evidence and alternatives in ${LAYOUT.noGo}.` : ' Read its summary for the evidence and alternatives.';
+    // After File anyway the worth-it question is settled; a later stop means
+    // the draft cannot be finished from the inventor's material.
+    if (against) return { level: 'nogo', label: "Stopped: the draft can't be finished from your material", detail: `${cap(stepName(killer.id))} reports it could not finish the draft from your material after you chose to proceed against the AI's recommendation. Read ${killer.id === 'verify' ? LAYOUT.noGo : 'its summary'} for the material gap and attempted fixes.`, decision, missing: [] };
     return { level: 'nogo', label: 'Finished: not worth filing', detail: `${cap(stepName(killer.id))} recommends stopping.${where}`, decision, missing: [] };
   }
 
