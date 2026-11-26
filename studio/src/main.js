@@ -4,7 +4,7 @@ import os from 'node:os';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readFileSync, existsSync, appendFileSync, mkdirSync, lstatSync, renameSync } from 'node:fs';
 import { detectAll, streamCommand, loginShellPath, childEnv, pyprojectVersion, compareVersions, processesRunningFrom, pythonToolsVersion, pythonVersion, pyprojectMinPython, toolsStatusReady, toolsPython } from './env.js';
-import { loadSettings, saveSettings, keyStatus, setKey, getKey, ensureWorkspace } from './settings.js';
+import { loadSettings, saveSettings, keyStatus, setKey, getKey, ensureWorkspace, migrateMacKeys } from './settings.js';
 import * as projects from './projects.js';
 import { PHASES, SECOND_OPINION, phaseById, statusProtocol, questionsFile, parseStatus, parseDecision, LAYOUT } from './workflow.js';
 import * as campaign from './campaign.js';
@@ -1105,6 +1105,11 @@ handle('dialog:pickWorkspace', async () => {
 });
 
 app.whenReady().then(async () => {
+  try {
+    migrateMacKeys();
+  } catch {
+    // Settings shows any keys that still need pasting again.
+  }
   projects.init(path.join(app.getPath('userData'), 'records'));
   // A step that was running when the app last closed did not finish.
   try {

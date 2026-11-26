@@ -27,7 +27,7 @@ export function renderSettings() {
       </div>
       <div class="card stack">
         <h2>API keys</h2>
-        <p class="muted" style="margin:0">An API key connects to your paid AI account. Keys are encrypted using your computer's keychain${s.keys.encryptionAvailable ? '' : ' (unavailable here; use a subscription)'}.</p>
+        <p class="muted" style="margin:0">An API key connects to your paid AI account. ${s.keys.storage === 'file' ? 'Keys are saved in a private file only your Mac account can open, so they carry over when you update the app.' : `Keys are encrypted by your computer's key storage${s.keys.encryptionAvailable ? '' : ' (unavailable here; use a subscription)'}.`}</p>${s.keys.unmigrated ? '<p class="muted" style="margin:0">Some keys saved by an earlier version could not be moved over. Paste them again and press Save settings.</p>' : ''}
         <label class="field">Anthropic API key ${s.keys.anthropic ? '<span class="pill good">saved</span>' : ''}<input type="password" id="k-anth" placeholder="${s.keys.anthropic ? 'Saved. Paste a new one to replace it.' : 'sk-ant-…'}"></label>
         <label class="field">OpenAI API key ${s.keys.openai ? '<span class="pill good">saved</span>' : ''}<input type="password" id="k-oai" placeholder="${s.keys.openai ? 'Saved. Paste a new one to replace it.' : 'sk-…'}"></label>
         <div class="row">${s.keys.anthropic ? '<button class="btn ghost sm" data-clear="anthropic">Remove Anthropic key</button>' : ''}${s.keys.openai ? '<button class="btn ghost sm" data-clear="openai">Remove OpenAI key</button>' : ''}</div>

@@ -16,7 +16,7 @@ let serverPath = null;
 let extraEnv = {};
 let extraKey = '';
 
-// Search keys from the app's keychain storage, passed to the server process
+// Search keys from the app's saved keys, passed to the server process
 // it starts. A change restarts the server on its next use.
 export function setExtraEnv(envObj) {
   const k = JSON.stringify(envObj || {});
