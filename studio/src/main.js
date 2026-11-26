@@ -22,6 +22,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // The studio lives inside the Patent Creator repo; the skill, agents and plugin
 // manifest are read from there. A packaged build carries them as resources.
 const REPO_ROOT = app.isPackaged ? path.join(process.resourcesPath, 'patent-creator') : path.resolve(here, '..', '..');
+const PATENT_SEARCH_TOOLS = /^(?:mcp__[\w-]+__)?(?:search_epo_patents|search_patents_google|search_patents_bigquery|search_patents_by_(?:cpc|ipc)_bigquery)$/;
 const SKILL_FILE = path.join(REPO_ROOT, 'skills', 'patent-application-creator', 'SKILL.md');
 const INDEX_HTML = path.join(here, '..', 'ui', 'index.html');
 const INDEX_URL = pathToFileURL(INDEX_HTML).href;
@@ -396,6 +397,10 @@ async function runPhase(projectId, phaseId, { engine: engineOverride, reply, fre
   const startedAt = new Date().toISOString();
   const logFile = projects.runLogPath(p, phaseId, startedAt);
   const run = { at: startedAt, engine, log: path.basename(logFile), reply: !!reply };
+  // A reply continues the same search, so it starts from what the run it
+  // continues had already found. A fresh start begins again from zero. Kept
+  // on the running record so a run the app closed on still carries it.
+  if (phaseId === 'sweep') Object.assign(run, { patentSearches: reply && !fresh ? prev?.runs?.at(-1)?.patentSearches || 0 : 0, fresh: !!fresh });
   const op = begin(projectId, phaseId, 'checks-before'); // nothing awaited since the ops.has check above
   // What this run starts from. The stamp it leaves is held to these, so an
   // answer changed or an earlier step rerun while it works shows as out of date.
@@ -528,6 +533,15 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
   let finalEv = null;
   const toolErrors = [];
   const refusedWrites = [];
+  // Step 2 counts only if a patent database answered at least one search.
+  // Web pages are a first screen, never the search itself.
+  const patentCalls = new Set();
+  let patentSearches = run.patentSearches || 0;
+  const countPatentSearch = (ev) => {
+    if (ev.kind === 'tool' && PATENT_SEARCH_TOOLS.test(ev.name || '')) patentCalls.add(ev.id);
+    if (ev.kind !== 'toolResult' || !patentCalls.delete(ev.id)) return;
+    if (ev.ok !== false && !/"error"\s*:/.test(String(ev.text || '').slice(0, 300))) patentSearches++;
+  };
   let drops = 0;
   let res = { code: retrySecondOpinion ? 0 : -1 };
   let searchReady = null;
@@ -601,11 +615,13 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
       for (;;) {
         finalEv = null;
         toolErrors.length = 0;
+        patentCalls.clear(); // tool ids restart with each process
         const handle = runEngine(
           { engine, cliPath, pcPath: pc, repoRoot: REPO_ROOT, appDataDir: app.getPath('userData'), cwd: p.folder, systemText, prompt: promptNow, resumeId: resumeNow, settings, key, serverEnv: searchEnv(), readDirs: materials },
           (ev) => {
             if (ev.kind === 'final') finalEv = ev;
             if (ev.kind === 'error') toolErrors.push(String(ev.text || '').slice(0, 2000));
+            countPatentSearch(ev);
             if (ev.kind === 'toolResult' && ev.ok === false && /requested permissions to write/i.test(ev.text || '')) refusedWrites.push(String(ev.text).match(/write to (.+?), but/)?.[1] || '');
             projects.appendRunLog(logFile, { t: Date.now(), ...ev });
             send('run:event', { projectId, phaseId, ev });
@@ -715,6 +731,10 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
       state = 'error';
       st.reason = 'The AI tried to save its work outside this invention\'s folder, which the app does not allow. Run this step again.';
     }
+    if (phaseId === 'sweep' && (state === 'done' || state === 'done-unconfirmed') && !patentSearches) {
+      state = 'error';
+      st.reason = 'The search finished without a single working patent database search, so it cannot count. Run step 2 again.';
+    }
     if ((state === 'done' || state === 'done-unconfirmed') && gone.length) {
       state = 'error';
       st.reason = `Required files or content are missing: ${gone.join('; ')}. Run this step again.`;
@@ -767,6 +787,7 @@ async function execute({ op, projectId, phase, engine, cliPath, key, pc, setting
     costUsd: finalEv?.costUsd ?? null,
     ms: Date.now() - Date.parse(run.at), // wall clock, including the app's own checks
     exitCode: res.code,
+    ...(phaseId === 'sweep' ? { patentSearches } : {}),
     ...(phaseId === 'decision' ? { secondOpinion: op.secondOpinion || op.decisionReview?.verdict || null, secondOpinionEngine: op.decisionReview?.secondEngine, secondOpinionCostUsd: op.decisionReview?.costUsd ?? null } : {}),
   };
   const lostConversation = !op.netFailed && !drops && !!resumeId && state === 'error' && !finalEv && !res.signal && !op.cancelled && !appError;

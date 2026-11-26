@@ -15,6 +15,8 @@ let connecting = null;
 let serverPath = null;
 let extraEnv = {};
 let extraKey = '';
+let clientKey = null;
+let epoch = 0; // bumped by disconnect(), so a server still starting is not kept
 
 // Search keys from the app's saved keys, passed to the server process
 // it starts. A change restarts the server on its next use.
@@ -23,7 +25,6 @@ export function setExtraEnv(envObj) {
   if (k !== extraKey) {
     extraKey = k;
     extraEnv = envObj || {};
-    if (client) disconnect();
   }
 }
 
@@ -36,10 +37,15 @@ export function sha256(text) {
 }
 
 export async function connect(patentCreatorPath) {
-  if (client && serverPath === patentCreatorPath) return client;
-  if (connecting) return connecting;
+  // A server started with other keys is replaced. The old one is taken out of
+  // use before it closes, so no call can land on a connection that is closing.
+  while (connecting) await connecting.catch(() => {});
+  if (client && serverPath === patentCreatorPath && clientKey === extraKey) return client;
   connecting = (async () => {
-    if (client) await client.close().catch(() => {});
+    const old = client;
+    client = null;
+    if (old) await old.close().catch(() => {});
+    const key = extraKey;
     const transport = new StdioClientTransport({
       command: patentCreatorPath,
       args: ['serve'],
@@ -47,11 +53,19 @@ export async function connect(patentCreatorPath) {
       stderr: 'pipe',
     });
     const c = new Client({ name: 'patent-creator-studio', version: '0.1.0' });
-    await c.connect(transport);
-    transport.onclose = () => {
+    const startedIn = epoch;
+    // The SDK's own transport handler rejects pending calls on close; this
+    // only forgets the client.
+    c.onclose = () => {
       if (client === c) client = null;
     };
+    await c.connect(transport);
+    if (startedIn !== epoch) {
+      await c.close().catch(() => {});
+      throw new Error('The patent tools were stopped.');
+    }
     client = c;
+    clientKey = key;
     serverPath = patentCreatorPath;
     return c;
   })();
@@ -63,8 +77,10 @@ export async function connect(patentCreatorPath) {
 }
 
 export async function disconnect() {
-  if (client) await client.close().catch(() => {});
+  epoch++;
+  const old = client;
   client = null;
+  if (old) await old.close().catch(() => {});
 }
 
 function unwrap(res) {
