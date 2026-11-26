@@ -137,7 +137,7 @@ function createWindow() {
     minWidth: 980,
     minHeight: 640,
     title: 'Patent Creator Studio',
-    backgroundColor: '#f6f3ee',
+    backgroundColor: '#17181b',
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     webPreferences: {
       preload: path.join(here, 'preload.cjs'),
@@ -146,7 +146,29 @@ function createWindow() {
       sandbox: true,
     },
   });
-  win.loadFile(INDEX_HTML);
+  // On the first start after installing or updating, macOS checks the new
+  // app and file reads stall meanwhile; seen live on a Mac, every load of the
+  // app's page hung for about 100 seconds and a load already waiting never
+  // recovered. So the window first shows a message that needs no file, then
+  // keeps starting the real page load again every few seconds until one
+  // finishes. It also reloads the page if its process ever dies.
+  const waiting = `data:text/html;charset=utf-8,${encodeURIComponent(`<!doctype html><meta charset="utf-8"><title>Patent Creator Studio</title><body style="margin:0;height:100vh;display:grid;place-items:center;background:#17181b;color:#e8e6e1;font:15px -apple-system,'Segoe UI',sans-serif"><div style="max-width:420px;text-align:center;line-height:1.5"><p style="font-size:18px;margin:0 0 8px">Opening Patent Creator Studio…</p><p style="margin:0;color:#9a9893">The first start after installing or updating can take a minute or two while your computer checks the app.</p></div>`)}`;
+  let pageLoaded = false;
+  const loadPage = () => win.loadFile(INDEX_HTML).catch(() => {});
+  win.webContents.on('did-finish-load', () => {
+    if (win.webContents.getURL().startsWith('file:')) pageLoaded = true;
+  });
+  win.webContents.on('render-process-gone', () => {
+    pageLoaded = false;
+    if (!win.isDestroyed()) loadPage();
+  });
+  const watchdog = setInterval(() => {
+    if (pageLoaded || win.isDestroyed()) return clearInterval(watchdog);
+    loadPage();
+  }, 6000);
+  win.loadURL(waiting).catch(() => {}).finally(() => {
+    if (!pageLoaded && !win.isDestroyed()) loadPage();
+  });
   // The window only ever shows the app's own page. Web links open in the
   // browser; anything else (a file the AI wrote, for instance) is refused, so
   // no document but ours can reach the app's bridge.

@@ -68,6 +68,43 @@ function run(cmd0, args0, opts = {}) {
   });
 }
 
+// Runs the person's login shell and returns what it printed. An interactive
+// shell ignores SIGTERM, and its profile can start helpers that keep the
+// output pipe open (a prompt theme's background daemon, for instance), so
+// a plain execFile timeout never ended it: startup waited forever and the
+// shells piled up. Here the shell gets its own process group, no terminal
+// input, and on timeout the whole group is killed; we return what arrived.
+function shellOutput(cmd, args, timeoutMs) {
+  return new Promise((resolve) => {
+    let out = '';
+    let done = false;
+    let child;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {}
+      resolve(out);
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    try {
+      child = spawn(cmd, args, { env: process.env, stdio: ['ignore', 'pipe', 'ignore'], detached: true });
+    } catch {
+      clearTimeout(timer);
+      return resolve('');
+    }
+    child.stdout.on('data', (d) => {
+      out += d;
+      // The PATH marker is complete: no need to wait for the shell to exit.
+      if (/__P__.*__P__/s.test(out)) finish();
+    });
+    child.on('error', finish);
+    child.on('exit', finish);
+  });
+}
+
 // One lookup at a time: the window opens while this runs, and every caller
 // that needs PATH (setup checks, installers, runs) waits on the same promise.
 let pathLookup = null;
@@ -83,8 +120,8 @@ async function lookUpShellPath() {
   let shellPath = '';
   if (!IS_WIN) {
     const shell = process.env.SHELL || '/bin/zsh';
-    const r = await run(shell, ['-ilc', 'printf "__P__%s__P__" "$PATH"'], { timeout: 8000, env: process.env });
-    const m = r.stdout.match(/__P__(.*)__P__/s);
+    const stdout = await shellOutput(shell, ['-ilc', 'printf "__P__%s__P__" "$PATH"'], 8000);
+    const m = stdout.match(/__P__(.*)__P__/s);
     if (m) shellPath = m[1];
   }
   const parts = [...shellPath.split(path.delimiter), ...(process.env.PATH || '').split(path.delimiter), ...extra].filter(Boolean);
