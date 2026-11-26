@@ -1149,8 +1149,10 @@ app.whenReady().then(async () => {
       if (changed) projects.update(p.id, (rec) => (rec.phases = p.phases));
     }
   } catch {}
-  await loginShellPath();
+  // Show the window first. Reading the login shell's PATH can take seconds
+  // (it runs the person's shell profile), and the window waited on it before.
   createWindow();
+  await loginShellPath();
   env().catch(() => {});
   checkUpdates();
 });

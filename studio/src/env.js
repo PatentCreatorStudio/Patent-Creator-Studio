@@ -68,8 +68,15 @@ function run(cmd0, args0, opts = {}) {
   });
 }
 
-export async function loginShellPath() {
-  if (cachedPath) return cachedPath;
+// One lookup at a time: the window opens while this runs, and every caller
+// that needs PATH (setup checks, installers, runs) waits on the same promise.
+let pathLookup = null;
+export function loginShellPath() {
+  if (cachedPath) return Promise.resolve(cachedPath);
+  pathLookup ??= lookUpShellPath().finally(() => (pathLookup = null));
+  return pathLookup;
+}
+async function lookUpShellPath() {
   const extra = IS_WIN
     ? [path.join(HOME, '.local', 'bin')]
     : [path.join(HOME, '.local/bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin', path.join(HOME, '.npm-global/bin')];
