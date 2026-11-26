@@ -98,8 +98,40 @@ export function aiAvailable(name, e = state.env, k = state.settings?.keys || {})
 
 export function updateNotice() {
   const update = state.update;
-  return update?.newer ? `Version ${esc(update.version)} is available. <a href="${esc(update.url)}">Download it</a>` : '';
+  if (!update?.newer) return '';
+  const progress = state.updateProgress;
+  const busy = progress && progress.stage !== 'error';
+  const label = progress?.stage === 'installing' ? 'Installing…'
+    : busy ? `Downloading… ${progress.percent ?? 0}%` : 'Update and restart';
+  return `Version ${esc(progress?.version || update.version)} is available.
+    <button class="btn sm" data-install-update ${busy ? 'disabled' : ''}>${label}</button>
+    ${progress?.reason ? `<span role="status">${esc(progress.reason)} <a href="${esc(update.url)}">Download it</a></span>` : ''}`;
 }
+
+function refreshUpdateNotices() {
+  document.querySelectorAll('#update-notice, [data-update-notice]').forEach((notice) => {
+    notice.innerHTML = updateNotice();
+  });
+}
+
+S.onUpdateProgress((progress) => {
+  state.updateProgress = progress;
+  refreshUpdateNotices();
+});
+
+document.addEventListener('click', async (e) => {
+  if (!e.target.closest?.('[data-install-update]')) return;
+  if (state.updateProgress && state.updateProgress.stage !== 'error') return;
+  state.updateProgress = { stage: 'downloading', percent: 0 };
+  refreshUpdateNotices();
+  try {
+    const result = await S.installUpdate();
+    if (!result.installed) state.updateProgress = { stage: 'error', reason: result.reason };
+  } catch (err) {
+    state.updateProgress = { stage: 'error', reason: err.message || 'The update could not be started.' };
+  }
+  refreshUpdateNotices();
+});
 
 // Web links open in the person's browser; nothing else navigates.
 document.addEventListener('click', (e) => {

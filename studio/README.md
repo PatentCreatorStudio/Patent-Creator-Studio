@@ -8,29 +8,11 @@ The app uses this repository's patent workflow and tools. It provides drafts, no
 
 ## Install
 
-Download the file for your computer from the latest release.
+Download the file for your computer from the latest release. The step-by-step install for Mac and Windows, including the automatic Mac install (`install-mac.sh`), is in [LANDING.md](LANDING.md#install), which is also the download repo's front page. After the first install, the app updates itself from the sidebar (**Update and restart**: downloads the release asset, checks GitHub's SHA-256 digest, swaps the app, reopens; see `src/updater.js`).
 
-### Mac
+### Requirements
 
-The app is free, so it isn't signed with a paid Apple Developer certificate. It is signed ad hoc, which Apple Silicon requires, and macOS will ask you to approve it once.
-
-1. Download the file ending in `-arm64-mac.zip` (Apple Silicon, M1 or newer) or the other `-mac.zip` (Intel), and double-click it.
-2. Drag **Patent Creator Studio** into **Applications**.
-3. Open it. macOS says it can't verify the developer. Select **Done**.
-4. Open **System Settings > Privacy & Security**, scroll to Security and select **Open Anyway** next to Patent Creator Studio. Enter your password, then select **Open Anyway** again.
-
-After that it opens like any other app. If you prefer Terminal, this does the same thing:
-
-```bash
-xattr -dr com.apple.quarantine "/Applications/Patent Creator Studio.app"
-```
-
-### Windows
-
-1. Download the `Setup` `.exe` file and run it.
-2. Windows SmartScreen says it protected your PC, because the installer isn't signed with a paid certificate. Select **More info**, then **Run anyway**.
-
-The app installs for your account only and needs no administrator rights. It needs Windows 10 (version 1809) or newer. Setup installs everything else, including its own copy of Python. Git is optional: without it, step 1 skips reading a code project's history. Graphviz is optional too.
+On Windows the app installs for your account only and needs no administrator rights. It needs Windows 10 (version 1809) or newer. Setup installs everything else, including its own copy of Python. Git is optional: without it, step 1 skips reading a code project's history. Graphviz is optional too.
 
 Claude Code needs a paid Claude plan (Pro or higher) or an API key. The free plan doesn't include it.
 

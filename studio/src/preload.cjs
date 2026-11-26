@@ -9,6 +9,12 @@ const call = (ch, ...args) =>
 contextBridge.exposeInMainWorld('studio', {
   env: (force) => call('env:get', force),
   checkUpdates: (force) => call('updates:check', force),
+  installUpdate: () => call('updates:install'),
+  onUpdateProgress: (fn) => {
+    const listener = (_event, progress) => fn(progress);
+    ipcRenderer.on('updates:progress', listener);
+    return () => ipcRenderer.removeListener('updates:progress', listener);
+  },
   settings: () => call('settings:get'),
   saveSettings: (patch) => call('settings:set', patch),
   setKey: (name, value) => call('settings:setKey', name, value),

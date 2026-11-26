@@ -16,6 +16,7 @@ import { writeDrawingsPdf, DRAWINGS_PDF } from './drawings-pdf.js';
 import { saveGitHistory } from './git-history.js';
 import { saveMaterialText } from './material-text.js';
 import * as installers from './installers.js';
+import { createUpdater } from './updater.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 // The studio lives inside the Patent Creator repo; the skill, agents and plugin
@@ -30,7 +31,20 @@ let envCache = null;
 let updateCache = null;
 let updateCheck = null;
 let updateCheckedAt = 0;
+let updateRelease = null;
+let setupOperations = 0;
 const loginRequests = new Map();
+const updater = createUpdater({
+  app,
+  getRelease: async () => {
+    const update = await checkUpdates(true);
+    if (update.error) throw new Error(update.error);
+    if (!update.newer || !updateRelease) throw new Error('There is no newer version to install.');
+    return updateRelease;
+  },
+  isBusy: () => ops.size > 0 || fixRounds.size > 0,
+  onProgress: (progress) => send('updates:progress', progress),
+});
 
 async function checkUpdates(force = false) {
   if (updateCheck) return updateCheck;
@@ -46,6 +60,7 @@ async function checkUpdates(force = false) {
       const newest = releases.filter((r) => !r.draft && /^v?\d+\.\d+\.\d+(?:-beta\.\d+)?$/.test(r.tag_name))
         .sort((a, b) => compareVersions(b.tag_name, a.tag_name))[0];
       const newer = !!newest && compareVersions(newest.tag_name, app.getVersion()) > 0;
+      updateRelease = newer ? newest : null;
       updateCache = { newer, ...(newer ? { version: newest.tag_name.replace(/^v/, ''), url: newest.html_url } : {}) };
     } catch {
       updateCache = { ...updateCache, error: 'Could not check for a newer version.' };
@@ -189,6 +204,7 @@ function findProject(id) {
 const ops = new Map(); // projectId -> { phaseId, stage, cancelled, stop }
 
 function begin(projectId, phaseId, stage) {
+  if (updater.isInstalling()) throw new Error('The app is updating. Wait for it to restart.');
   if (ops.has(projectId)) throw new Error('This invention is busy. Wait for the current work to finish.');
   const op = { phaseId, stage, cancelled: false, stop: null };
   ops.set(projectId, op);
@@ -266,6 +282,7 @@ async function runAndWait(projectId, phaseId) {
 // recommends stopping or fails, or MAX_FIX_ROUNDS rounds have run. While it
 // runs, steps cannot be started by hand.
 function startFixRound(projectId) {
+  if (updater.isInstalling()) throw new Error('The app is updating. Wait for it to restart.');
   findProject(projectId);
   if (fixRounds.has(projectId) || ops.has(projectId)) throw new Error('This invention is busy. Wait for the current work to finish.');
   const fr = { cancelled: false, status: 'Starting the fix round…' };
@@ -830,18 +847,26 @@ function gateLine(s) {
 
 // Only the app's own page may call in.
 function handle(channel, fn) {
+  const setupWork = ['setup:install', 'setup:installTool', 'setup:login'].includes(channel);
   ipcMain.handle(channel, async (e, ...args) => {
     if (!e.senderFrame || e.senderFrame.url.split('#')[0] !== INDEX_URL) return { ok: false, error: 'This request came from outside the app. Open Patent Creator Studio to continue.' };
+    if (setupWork && updater.isInstalling()) return { ok: false, error: 'The app is updating. Wait for it to restart.' };
+    if (setupWork) setupOperations++;
     try {
       return { ok: true, value: await fn(...args) };
     } catch (err) {
       return { ok: false, error: err?.message || String(err) };
+    } finally {
+      if (setupWork) setupOperations--;
     }
   });
 }
 
 handle('env:get', (force) => env(force));
 handle('updates:check', (force) => checkUpdates(!!force));
+handle('updates:install', () => setupOperations
+  ? { installed: false, reason: 'Finish setting up your tools before updating the app.' }
+  : updater.install());
 handle('settings:get', () => ({ ...loadSettings(), keys: keyStatus(), engines: ENGINES, repoRoot: REPO_ROOT }));
 handle('settings:set', async (patch) => {
   const allowed = ['draftEngine', 'reviewEngine', 'claudeModel', 'codexModel', 'codexEffort', 'workspace', 'googleCloudProject'];

@@ -81,7 +81,7 @@ export function renderSetup() {
   main.innerHTML = `<div class="page" style="max-width:860px">
     <div class="page-head"><div><h1>Setup</h1><p class="lede">Install the patent tools and one AI to start. Set up both Claude Code and Codex for the second AI review.</p></div><button class="btn" id="recheck">Check again</button></div>
     ${state.update?.error ? `<p class="small">${esc(state.update.error)}</p>` : ''}
-    ${state.update?.newer ? `<p class="small">${updateNotice()}</p>` : ''}
+    <p class="small" data-update-notice>${updateNotice()}</p>
     ${
       !e
         ? '<div class="card muted">Checking installed tools…</div>'

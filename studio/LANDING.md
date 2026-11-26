@@ -16,7 +16,7 @@ Get the newest version from **[Releases](../../releases)**:
 - **Mac with Intel:** the other `-mac.zip`
 - **Windows 10 or newer:** the `Setup` `.exe`
 
-The app tells you when a newer version is out.
+After you install it once, updates happen inside the app: when a new version is out, select **Update and restart** in the sidebar. The app downloads it, checks it, swaps itself and reopens. You don't download anything again.
 
 ## What you need
 
@@ -28,22 +28,34 @@ The app installs everything else itself: Claude Code, Codex, Python, the patent 
 
 ## Install
 
-### Mac
+### Mac: the automatic way
 
-The app is free, so it isn't signed with a paid Apple Developer certificate, and macOS asks you to approve it once.
+Open **Terminal** (press Command and Space, type `Terminal`, press Return), paste this line, and press Return:
 
-1. Double-click the zip you downloaded, then drag **Patent Creator Studio** into **Applications**.
-2. Open it. macOS says it can't verify the developer. Select **Done**.
-3. Open **System Settings > Privacy & Security**, scroll to Security, and select **Open Anyway** next to Patent Creator Studio. Enter your password, then select **Open Anyway** again.
+```
+curl -fsSL https://raw.githubusercontent.com/PatentCreatorStudio/Patent-Creator-Studio/main/studio/install-mac.sh | sh
+```
 
-After that it opens like any other app.
+It downloads the newest version for your Mac, checks it against the checksum GitHub publishes, puts it in Applications and opens it. macOS doesn't stop it, so there's nothing to approve. You can [read the script](install-mac.sh) first.
+
+### Mac: by hand
+
+The app is free, so it isn't signed with a paid Apple Developer certificate, and macOS blocks it the first time. You approve it once.
+
+1. Double-click the zip you downloaded. **Patent Creator Studio** appears next to it.
+2. Drag **Patent Creator Studio** into your **Applications** folder.
+3. Open it from Applications. macOS says it can't verify the developer. Select **Done**. Don't select **Move to Trash**: that throws the app away.
+4. Open the Apple menu, then **System Settings**, then **Privacy & Security** in the sidebar.
+5. Scroll down to **Security**. Next to "Patent Creator Studio was blocked", select **Open Anyway**. Enter your Mac password, then select **Open Anyway** again.
+
+After that it opens like any other app, and it updates itself.
 
 ### Windows
 
-1. Run the `Setup` `.exe`.
-2. Windows SmartScreen says it protected your PC, because the installer isn't signed with a paid certificate. Select **More info**, then **Run anyway**.
+1. Run the `Setup` `.exe` you downloaded.
+2. Windows says it protected your PC, because the installer isn't signed with a paid certificate. Select **More info**, then **Run anyway**.
 
-It installs for your account only and needs no administrator rights.
+It installs for your account only and needs no administrator rights. After that it updates itself.
 
 ### First run
 
@@ -73,7 +85,7 @@ It tells you "no" when the evidence says no. A well-reasoned "this already exist
 
 It writes drafts for a registered patent attorney or agent to review. It doesn't give legal advice, and it doesn't file anything. Its goal is to make that professional's review fast and affordable. Open **Costs and legal help** in the app for fees, deadlines and free legal assistance programs.
 
-Your AI sends what you describe to Anthropic or OpenAI, under your own account. Your keys are stored with your operating system's secure storage.
+Your AI sends what you describe to Anthropic or OpenAI, under your own account. Your keys stay on your computer. On Windows they're encrypted by Windows. On a Mac they're kept in a private file only your Mac account can open, so they carry over when the app updates.
 
 ## It's a beta
 
