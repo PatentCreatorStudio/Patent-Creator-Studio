@@ -95,10 +95,24 @@ S.on('project:changed', (p) => {
 (async function boot() {
   state.phases = await S.phases();
   state.settings = await S.settings();
-  S.checkUpdates().then((update) => {
-    state.update = update;
-    renderSidebar();
-    if (state.view === 'setup') renderSetup();
+  // A copy left open for days still has to hear about a new version: check at
+  // start, every half hour, and when the window comes back after 10 minutes away.
+  let lastUpdateCheck = 0;
+  const refreshUpdate = (force) => {
+    lastUpdateCheck = Date.now();
+    S.checkUpdates(force).then((update) => {
+      const changed = update?.newer !== state.update?.newer || update?.version !== state.update?.version;
+      state.update = update;
+      if (changed) {
+        renderSidebar();
+        if (state.view === 'setup') renderSetup();
+      }
+    }).catch(() => {});
+  };
+  refreshUpdate(false);
+  setInterval(() => refreshUpdate(true), 30 * 60 * 1000);
+  window.addEventListener('focus', () => {
+    if (Date.now() - lastUpdateCheck > 10 * 60 * 1000) refreshUpdate(true);
   });
   render();
   state.env = await guard(() => S.env());
