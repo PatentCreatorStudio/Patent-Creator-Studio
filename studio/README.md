@@ -96,4 +96,4 @@ Mac, November 17: Codex wrote steps 4 to 7 with Claude attacking at step 8, afte
 
 Mac, November 20, on an empty home folder with no Claude Code, Codex, Python, uv or patent tools: Setup installed Claude Code and Codex with their makers' installers, then the patent tools on their own Python 3.12, and built the rulebook (66,692 passages) in about 36 minutes, all from the app's buttons. A saved API key counts as ready, and Cancel ends a waiting sign-in.
 
-Not yet exercised: the two API-key options with real keys, steps 7 and 8 on Windows, a computer with no Graphviz, and the step 3 retry ("ready") and patent-search-off stop with a live AI, which wait on a working patent search key.
+Not yet exercised: the two API-key options with real keys, steps 7 and 8 on Windows, a computer with no Graphviz. Proven on a Mac on Nov 26 with EPO as the only search source: step 2 stops at once when patent search is off, and replying "ready" after signing in to the second AI reruns only the second opinion, leaving the first recommendation unchanged.

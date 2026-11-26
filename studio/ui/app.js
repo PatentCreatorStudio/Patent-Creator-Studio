@@ -65,6 +65,8 @@ export function render() {
 function renderWelcome() {
   const e = state.env;
   const ready = e && toolsReady(e);
+  const updateOnly = !ready && e?.patentCreator?.outdated && e.patentCreator.canUpdate && (aiAvailable('claude', e) || aiAvailable('codex', e));
+  const setupLabel = updateOnly ? 'Update the patent tools (a few minutes)' : 'Set up (about an hour, mostly waiting)';
   main.innerHTML = `<div class="welcome">
     <h1>Develop your patent draft</h1>
     <p class="lede">Use Claude Code or Codex to research your idea and prepare a draft for professional review. If the idea isn't worth filing, it tells you so plainly.</p>
@@ -76,7 +78,7 @@ function renderWelcome() {
       <li><div><b>Prepare files for professional review.</b> Include the findings and open questions.</div></li>
     </ol>
     <div class="row">
-      ${ready ? '<button class="btn primary" id="w-new">New invention</button>' : '<button class="btn primary" id="w-setup">Set up (about an hour, mostly waiting)</button>'}
+      ${ready ? '<button class="btn primary" id="w-new">New invention</button>' : `<button class="btn primary" id="w-setup">${setupLabel}</button>`}
       <button class="btn" id="w-help">Costs and legal help</button>
     </div>
   </div>`;

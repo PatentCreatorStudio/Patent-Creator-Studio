@@ -123,6 +123,7 @@ export function renderSetup() {
     state.installing = false;
     if (r) ((state.env = r), toast(r.patentCreator?.outdated ? 'The patent tools are still out of date. Read the setup log.' : 'The patent tools are ready.'));
     renderSetup();
+    renderSidebar();
   });
   if (e?.patentCreator.ready && !e.patentCreator.outdated) {
     const box = $('#search-item');
