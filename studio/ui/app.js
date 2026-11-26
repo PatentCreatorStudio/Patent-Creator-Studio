@@ -35,7 +35,24 @@ const toolsReady = (e) => e.patentCreator.ready && !e.patentCreator.outdated && 
 document.querySelectorAll('.navlink').forEach((b) => (b.onclick = () => go(b.dataset.view)));
 $('#new-btn').onclick = () => intakeModal();
 
+// A copy left open for days still has to hear about a new version: check at
+// start, every half hour, when the window comes back after 10 minutes away,
+// and whenever Setup is opened.
+let lastUpdateCheck = 0;
+function refreshUpdate(force) {
+  lastUpdateCheck = Date.now();
+  S.checkUpdates(force).then((update) => {
+    const changed = update?.newer !== state.update?.newer || update?.version !== state.update?.version;
+    state.update = update;
+    if (changed) {
+      renderSidebar();
+      if (state.view === 'setup') renderSetup();
+    }
+  }).catch(() => {});
+}
+
 export function go(view) {
+  if (view === 'setup') refreshUpdate(true);
   state.view = view;
   if (view !== 'project') state.projectId = null;
   render();
@@ -95,20 +112,6 @@ S.on('project:changed', (p) => {
 (async function boot() {
   state.phases = await S.phases();
   state.settings = await S.settings();
-  // A copy left open for days still has to hear about a new version: check at
-  // start, every half hour, and when the window comes back after 10 minutes away.
-  let lastUpdateCheck = 0;
-  const refreshUpdate = (force) => {
-    lastUpdateCheck = Date.now();
-    S.checkUpdates(force).then((update) => {
-      const changed = update?.newer !== state.update?.newer || update?.version !== state.update?.version;
-      state.update = update;
-      if (changed) {
-        renderSidebar();
-        if (state.view === 'setup') renderSetup();
-      }
-    }).catch(() => {});
-  };
   refreshUpdate(false);
   setInterval(() => refreshUpdate(true), 30 * 60 * 1000);
   window.addEventListener('focus', () => {
