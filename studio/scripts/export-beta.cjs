@@ -8,7 +8,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 
-const BETA = 'PatentCreatorStudio/Patent-Creator-Studio-Beta';
+const BETA = 'PatentCreatorStudio/Patent-Creator-Studio';
 const AUTHOR = { name: 'RobThePCGuy', email: '10876982+RobThePCGuy@users.noreply.github.com' };
 const tag = process.argv[2];
 if (!/^v\d+\.\d+\.\d+(-[\w.]+)?$/.test(tag || '')) throw new Error('Give a tag like v0.1.0-beta.6');

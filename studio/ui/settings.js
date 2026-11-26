@@ -30,7 +30,7 @@ export function renderSettings() {
         <p class="muted" style="margin:0">An API key connects to your paid AI account. Keys are encrypted using your computer's keychain${s.keys.encryptionAvailable ? '' : ' (unavailable here; use a subscription)'}.</p>
         <label class="field">Anthropic API key ${s.keys.anthropic ? '<span class="pill good">saved</span>' : ''}<input type="password" id="k-anth" placeholder="${s.keys.anthropic ? 'Saved. Paste a new one to replace it.' : 'sk-ant-…'}"></label>
         <label class="field">OpenAI API key ${s.keys.openai ? '<span class="pill good">saved</span>' : ''}<input type="password" id="k-oai" placeholder="${s.keys.openai ? 'Saved. Paste a new one to replace it.' : 'sk-…'}"></label>
-        <div class="row"><button class="btn" id="save-keys">Save keys</button>${s.keys.anthropic ? '<button class="btn ghost sm" data-clear="anthropic">Remove Anthropic key</button>' : ''}${s.keys.openai ? '<button class="btn ghost sm" data-clear="openai">Remove OpenAI key</button>' : ''}</div>
+        <div class="row">${s.keys.anthropic ? '<button class="btn ghost sm" data-clear="anthropic">Remove Anthropic key</button>' : ''}${s.keys.openai ? '<button class="btn ghost sm" data-clear="openai">Remove OpenAI key</button>' : ''}</div>
       </div>
       <div class="card stack">
         <h2>Patent search</h2>
@@ -51,7 +51,7 @@ export function renderSettings() {
         <p class="muted" style="margin:0">Search patent text worldwide through a Google Cloud billing project. <a href="#" data-ext="https://console.cloud.google.com/projectcreate">Create a project</a>.</p>
         <p class="muted" style="margin:0">Needs a Google Cloud sign-in on this computer. Run <code>gcloud auth application-default login</code> in a terminal. Each keyword search scans about 341 GiB. The free allowance covers about three searches a month; further searches are billed to your project.</p>
         <label class="field">Google Cloud project ID ${s.googleCloudProject ? '<span class="pill good">saved</span>' : ''}<input type="text" id="s-gcp" value="${esc(s.googleCloudProject || '')}" placeholder="your-project-id"></label>
-        <div class="row"><button class="btn" id="save-search">Save search settings</button>${s.googleCloudProject ? '<button class="btn ghost sm" id="clear-project">Remove project ID</button>' : ''}</div>
+        ${s.googleCloudProject ? '<div><button class="btn ghost sm" id="clear-project">Remove project ID</button></div>' : ''}
       </div>
       <div class="card stack">
         <h2>Where inventions are kept</h2>
@@ -64,25 +64,27 @@ export function renderSettings() {
     (b) =>
       (b.onclick = () => {
         s[b.dataset.field] = b.dataset.id;
+        const typed = Object.fromEntries([...main.querySelectorAll('input[id]')].map((i) => [i.id, i.value]));
         renderSettings();
+        for (const [id, v] of Object.entries(typed)) if ($('#' + id)) $('#' + id).value = v;
       })
   );
+  // One Save button for the whole screen: pasted keys, search settings, AI choices.
   $('#save-s').onclick = async () => {
+    const keyFields = { anthropic: '#k-anth', openai: '#k-oai', serpapi: '#k-serp', epoKey: '#k-epo', epoSecret: '#k-epo-secret', uspto: '#k-uspto' };
+    let keysSaved = 0;
+    for (const [name, selector] of Object.entries(keyFields)) {
+      const value = $(selector).value.trim();
+      if (!value) continue;
+      if (!(await attempt(() => S.setKey(name, value)))) return;
+      keysSaved++;
+    }
     const patch = { draftEngine: s.draftEngine, reviewEngine: s.reviewEngine, claudeModel: $('#s-cm').value.trim(), codexModel: $('#s-xm').value.trim(), codexEffort: $('#s-xe').value, googleCloudProject: $('#s-gcp').value.trim() };
     if (engineFamily(patch.draftEngine) === engineFamily(patch.reviewEngine)) toast('The writer and reviewer use the same AI. Choose the other AI for the review.', true);
-    const saved = await attempt(() => S.saveSettings(patch));
-    state.settings = await S.settings();
-    if (saved) toast('Saved.');
-  };
-  $('#save-keys').onclick = async () => {
-    const a = $('#k-anth').value.trim();
-    const o = $('#k-oai').value.trim();
-    if (!a && !o) return toast('Paste a key first.', true);
-    const okA = !a || (await attempt(() => S.setKey('anthropic', a)));
-    const okO = !o || (await attempt(() => S.setKey('openai', o)));
+    if (!(await attempt(() => S.saveSettings(patch)))) return;
     state.settings = await S.settings();
     renderSettings();
-    if (okA && okO) toast(a && o ? 'Both keys saved.' : 'Key saved.');
+    toast(keysSaved ? `Saved, with ${keysSaved === 1 ? 'one key' : `${keysSaved} keys`}.` : 'Saved.');
   };
   main.querySelectorAll('[data-clear]').forEach(
     (b) =>
@@ -92,17 +94,6 @@ export function renderSettings() {
         renderSettings();
       })
   );
-  $('#save-search').onclick = async () => {
-    for (const [name, selector] of Object.entries({ serpapi: '#k-serp', epoKey: '#k-epo', epoSecret: '#k-epo-secret', uspto: '#k-uspto' })) {
-      const value = $(selector).value.trim();
-      if (value && !(await attempt(() => S.setKey(name, value)))) return;
-    }
-    if (await attempt(() => S.saveSettings({ googleCloudProject: $('#s-gcp').value.trim() }))) {
-      state.settings = await S.settings();
-      toast('Search settings saved.');
-      renderSettings();
-    }
-  };
   $('#clear-project')?.addEventListener('click', async () => {
     if (!(await attempt(() => S.saveSettings({ googleCloudProject: '' })))) return;
     state.settings = await S.settings();

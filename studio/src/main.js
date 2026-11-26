@@ -37,7 +37,7 @@ async function checkUpdates(force = false) {
   if (!force && updateCache && Date.now() - updateCheckedAt < 60 * 60 * 1000) return updateCache;
   updateCheck = (async () => {
     try {
-      const response = await fetch('https://api.github.com/repos/PatentCreatorStudio/Patent-Creator-Studio-Beta/releases?per_page=10', {
+      const response = await fetch('https://api.github.com/repos/PatentCreatorStudio/Patent-Creator-Studio/releases?per_page=10', {
         headers: { Accept: 'application/vnd.github+json', 'User-Agent': 'Patent-Creator-Studio' },
         signal: AbortSignal.timeout(5000),
       });

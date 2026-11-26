@@ -1,6 +1,6 @@
 {
   "name": "patent-creator-studio",
-  "version": "0.1.0-beta.10",
+  "version": "0.1.0-beta.11",
   "description": "Desktop studio for Claude Patent Creator",
   "main": "src/main.js",
   "scripts": {
@@ -66,9 +66,8 @@
     "afterPack": "./scripts/adhoc-sign.cjs",
     "publish": {
       "provider": "github",
-      "owner": "RobThePCGuy",
-      "repo": "Patent-Creator-Studio",
-      "private": true
+      "owner": "PatentCreatorStudio",
+      "repo": "Patent-Creator-Studio"
     }
   }
 }
